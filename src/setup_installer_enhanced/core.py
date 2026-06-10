@@ -538,6 +538,43 @@ class Installer:
         ta_ver = getattr(self.args, "torchaudio_version", None)
         pinned_fallback_tried = False
 
+        # BUG-51 fix (reorder for Blackwell+): for GPUs with compute
+        # capability >= 12.0 (RTX 50-series / Blackwell and newer), we
+        # already KNOW from experience that "latest torch" under every
+        # cuXXX index resolves to the same CUDA-13-based build that fails
+        # torch.cuda.is_available() on current drivers — so walking the
+        # full cu128 -> cu127 -> cu121 -> cu118 ladder first just wastes
+        # several ~530MB downloads/uninstalls before reaching the pinned
+        # fallback anyway. For these GPUs ONLY, try the pinned fallback
+        # FIRST. If it fails for any reason, fall through to the normal
+        # ladder below unchanged (so the existing safety net still applies).
+        # GPUs below compute_cap 12.0 (4090, 3090, etc.) are completely
+        # unaffected and keep the original ladder-first order.
+        gpu_info_early = self._detect_nvidia_smi_basic()
+        if gpu_info_early and gpu_info_early.get("gpus", 0) > 0:
+            cc_early = gpu_info_early.get("compute_cap")
+            if cc_early is not None and cc_early >= 12.0:
+                log(
+                    "info",
+                    f"BUG-51: detected Blackwell-class GPU (compute_cap="
+                    f"{cc_early}, {gpu_info_early.get('names')}) before "
+                    "trying the normal CUDA-tag ladder. 'Latest' torch is "
+                    "known to be incompatible with this driver/architecture "
+                    "combo across all cuXXX tags, so trying the pinned "
+                    "fallback build FIRST to avoid wasted downloads.",
+                )
+                pinned_fallback_tried = True
+                if self._try_pinned_fallback(
+                    gpu_info_early, candidates, no_deps, tv_ver, ta_ver
+                ):
+                    return True
+                log(
+                    "warn",
+                    "BUG-51: pinned-fallback-first attempt did not succeed; "
+                    "falling back to the normal CUDA-tag ladder "
+                    f"({candidates}) as a safety net.",
+                )
+
         for cand in candidates:
             if cand == "cpu":
                 # BUG-51 fix: before giving up and installing CPU-only torch,
