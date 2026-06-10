@@ -908,7 +908,9 @@ class Installer:
         out = err = ""
         for attempt in range(1, max_retries + 1):
             if attempt > 1:
-                log("warn", f"Retrying {task.name} (attempt {attempt}/{max_retries})...")
+                log(
+                    "warn", f"Retrying {task.name} (attempt {attempt}/{max_retries})..."
+                )
             code, out, err = self.run_stream(
                 pip_cmd,
                 task_name=f"{task.name}{'_retry' + str(attempt - 1) if attempt > 1 else ''}",
@@ -925,7 +927,10 @@ class Installer:
             return True
         else:
             self.summary["failed"].append(task.name)
-            log("error", f"Failed to install {task.name} after {max_retries} attempt(s): returncode={code}")
+            log(
+                "error",
+                f"Failed to install {task.name} after {max_retries} attempt(s): returncode={code}",
+            )
             tail = err.splitlines()[-10:] if err else []
             if tail:
                 log("error", "Last pip stderr lines:\n" + "\n".join(tail))
@@ -1161,7 +1166,7 @@ class Installer:
             shutil.rmtree(self.tempdir)
         except Exception:
             pass
-, f"Wrote install metrics to {self.args.metrics_file}")
+            log("ok", f"Wrote install metrics to {self.args.metrics_file}")
         except Exception as e:
             log("warn", f"Failed to write metrics file: {e}")
 
@@ -1178,18 +1183,18 @@ class Installer:
                     ", ".join(self.summary["already"]) or "-",
                 )
                 t.add_row("Failed", ", ".join(self.summary["failed"]) or "-")
-                t.add_row("Time(s)", f"{total_time:.1f}s")
+                t.add_row("Time(s)", f"{self.metrics['elapsed_s']:.1f}s")
                 CONSOLE.print(t)
             except Exception:
                 log("info", f"Summary Installed: {self.summary['installed']}")
                 log("info", f"Already/Skipped: {self.summary['already']}")
                 log("info", f"Failed: {self.summary['failed']}")
-                log("info", f"Total time: {total_time:.1f}s")
+                log("info", f"Total time: {self.metrics['elapsed_s']:.1f}s")
         else:
             log("info", f"Summary Installed: {self.summary['installed']}")
             log("info", f"Already/Skipped: {self.summary['already']}")
             log("info", f"Failed: {self.summary['failed']}")
-            log("info", f"Total time: {total_time:.1f}s")
+            log("info", f"Total time: {self.metrics['elapsed_s']:.1f}s")
 
     def cleanup(self):
         try:
@@ -1200,5 +1205,5 @@ class Installer:
             shutil.rmtree(self.tempdir)
         except Exception:
             pass
-except Exception:
+        except Exception:
             pass
