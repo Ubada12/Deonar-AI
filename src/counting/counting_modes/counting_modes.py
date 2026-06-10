@@ -75,8 +75,18 @@ def process_frame_zone(dets, zone, feeder, fps, args, state, csvs, colorer):
                     )
 
         elif ev["type"] == "entry":
-            # optional: debug logging
-            if not args.quiet:
+            # BUG-21 fix: the ghost_born branch below was an `elif ev["type"]=="entry"`
+            # that could never be reached — this elif already handles ALL "entry"
+            # events.  Merged the ghost_born path here so it actually executes.
+            if ev.get("method") == "ghost_born":
+                # Zone already added tid to ghost_ids in update_for_frame();
+                # we log it prominently here for operator visibility.
+                log.error(
+                    "MODES-ZONE",
+                    f" Ghost-born entry: tid={ev['tid']} via {ev.get('edge_name','?')} "
+                    f"({ev['pt'][0]:.1f},{ev['pt'][1]:.1f})",
+                )
+            elif not args.quiet:
                 log.debug(
                     "MODES-ZONE",
                     f" ENTRY: tid={tid} via {ev.get('edge_name','?')} "
@@ -93,14 +103,6 @@ def process_frame_zone(dets, zone, feeder, fps, args, state, csvs, colorer):
                     f" EXIT: tid={tid} {entry_edge} → {exit_edge} "
                     f"(no count, frame={feeder.out_index}, method={ev.get('method','?')})",
                 )
-
-        elif ev and ev["type"] == "entry" and ev.get("method") == "ghost_born":
-            zone.ghost_ids.add(int(tid))
-            log.error(
-                "MODES-ZONE",
-                f" Ghost-born entry: tid={ev['tid']} via {ev['edge_name']} "
-                f"({ev['pt'][0]:.1f},{ev['pt'][1]:.1f})",
-            )
 
 
 def process_frame_dual(

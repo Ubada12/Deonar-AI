@@ -182,5 +182,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    """Entry point for CLI."""
+    # BUG-38 fix: string literal """Entry point for CLI.""" appeared AFTER the
+    # main() call — it was a misplaced docstring that did nothing (Python string
+    # literals as statements are only docstrings when they are the FIRST statement
+    # of a module/class/function).  Moved to a proper comment above.
+    sys.exit(main() or 0)

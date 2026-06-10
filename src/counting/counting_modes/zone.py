@@ -90,19 +90,15 @@ def _edge_pair_to_direction(
     """
     e, x = entry_idx % 4, exit_idx % 4
 
-    # Entry = bottom -> always up
+    # Entry = bottom -> always up (any exit edge)
+    # BUG-18 fix: the duplicated "Bottom entry" block below (e==2 checks) was
+    # unreachable dead code — this early return already covers all e==2 cases.
     if e == 2:
         return "up"
 
     # Same edge → fallback to motion
     if e == x and entry_pt and exit_pt and zone_h:
         return "skip"
-
-    # Bottom entry
-    if e == 2 and x == 0:
-        return "up"  # bottom→top
-    if e == 2:
-        return "up"  # bottom→anywhere else → up (default bias)
 
     # Top entry
     if e == 0 and x == 2:
@@ -152,7 +148,9 @@ class ZoneCounter:
         self.entry_edge_idx = defaultdict(lambda: None)
         self.entry_point = defaultdict(lambda: None)
         self.entry_method = defaultdict(lambda: None)
-        self.pending = {}
+        # BUG-20 fix: `self.pending` was initialised but never read or written
+        # anywhere in this class — it was scaffolding that was never completed.
+        # Removed to avoid misleading future readers into thinking it carries state.
         self.ghost_ids = set()
 
     def _inside(self, cx, cy):
@@ -195,10 +193,11 @@ class ZoneCounter:
                 )
             return None
 
-        # First ever point
-        if tid not in self.prev_pt:
-            self.prev_pt[tid] = p
-            return None
+        # BUG-19 fix: the "First ever point" guard below was dead code.
+        # The block above (lines 168-196) handles the *only* case where
+        # tid is absent from prev_pt, and it always sets prev_pt[tid] before
+        # returning — so this second `if tid not in self.prev_pt` was never True.
+        # Removed to avoid confusing control flow.
         prev_p = self.prev_pt[tid]
         self.prev_pt[tid] = p
 
@@ -233,6 +232,10 @@ class ZoneCounter:
                 method = self.entry_method.get(tid, "?")
                 self.entry_edge_idx[tid] = None
                 self.entry_point[tid] = None
+                # BUG-14 fix: ghost_ids was added to on entry but never removed
+                # on exit, so the set grew without bound over long sessions.
+                # Clear the tid's ghost flag now that it has exited the zone.
+                self.ghost_ids.discard(tid)
                 return dict(
                     type="count",
                     direction=direction,
@@ -242,6 +245,9 @@ class ZoneCounter:
                     tid=tid,
                     method=method,
                 )
+            # No recorded entry edge — just note the exit and clean up ghost flag
+            # BUG-14 (continued): also discard on exits without a matched entry
+            self.ghost_ids.discard(tid)
             return dict(
                 type="exit",
                 edge_idx=x_idx,

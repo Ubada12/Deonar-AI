@@ -560,7 +560,7 @@ def _compose_frames(
                     full_disp,
                     [
                         f"Counts Up:{hud_data['up']} Down:{hud_data['down']} Total:{hud_data['total']}",
-                        f"Frame {hud_data['frame']}/{total if total > 0 else '?'} Source {hud_data['res']}",
+                        f"Frame {hud_data.get('frame_in', '?')}/{total if total > 0 else '?'} Source {hud_data.get('res', '?')}",
                     ],
                     org=(8, 32),
                 )

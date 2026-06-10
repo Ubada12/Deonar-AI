@@ -161,6 +161,18 @@ class WebRTCServer:
         self._slot_api_port = int(port)
         log.debug("WEBRTC", f"Slot API port set to {self._slot_api_port}")
 
+    def set_slot_manager(self, slot_mgr) -> None:
+        """
+        BUG-11 fix: _slot_manager was initialised to None in __init__ with no
+        setter method, so runners had no documented path to inject a SlotManager.
+        They were directly assigning `server._slot_manager = mgr` (attribute
+        access on a private name — fragile).  This method provides the proper
+        public API for injection, consistent with set_control_queue() and
+        set_status_provider().
+        """
+        self._slot_manager = slot_mgr
+        log.debug("WEBRTC", "SlotManager attached")
+
     def publish(self, frame: np.ndarray) -> None:
         """
         Thread-safe: push latest frame (numpy BGR, HxWx3 uint8) to ALL connected clients.

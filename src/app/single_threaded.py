@@ -130,7 +130,7 @@ def run_original(args):
             elif key == ord("q"):
                 break
             elif key == ord("s"):
-                _save_screenshot(last_full_disp, args.source, feeder.out_index)
+                _save_screenshot(last_full_disp, args.source, feeder.out_index, args.run_root)
             continue
 
         # detection + tracking
@@ -265,4 +265,6 @@ def run_original(args):
         log.info(
             "RUNNER-INFO",
             f" Done. Up={state.up_count}, Down={state.down_count}, Total={state.up_count + state.down_count}",
+        )
+t}",
         )

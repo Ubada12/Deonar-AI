@@ -36,7 +36,8 @@ from src.display.drawing import (
     _save_screenshot,
 )
 from src.geometry.geom import _build_lines
-from src.counting.counting_modes.init_counting_modes import _init_dual_lines
+from src.counting.counting_modes.init_counting_modes import _init_dual_lines, _init_zone
+from src.counting.counting_modes.zone import ZoneCounter
 from src.io.io import CsvWriters
 from src.counting.counting_modes.counting_modes import (
     process_frame_zone,
@@ -149,6 +150,15 @@ class DisplayWorker(threading.Thread):
         self._lineB_roi = None
         self._lineA_full = None
         self._lineB_full = None
+
+        # BUG-01/BUG-02 fix: zone object was never initialized in DisplayWorker —
+        # _ensure_zone() adds the same lazy-init pattern used for dual-line.
+        # zone_obj is the ZoneCounter instance; None until first frame.
+        self._zone_inited = False
+        self._use_zone = False
+        self._zone_obj = None
+        self._zone_rect_roi = None
+        self._zone_rect_full = None
 
         # counting state (own instance)
         self.state = _init_count_state(self.args.min_side_frames)
@@ -549,6 +559,61 @@ class DisplayWorker(threading.Thread):
             self._lineB_full,
         )
 
+    def _ensure_zone(self, rx: int, ry: int, rw: int, rh: int):
+        """
+        Lazily initialize the ZoneCounter exactly once (mirrors _ensure_dual).
+
+        BUG-01 fix (complete): _init_zone() returns zone=None as a placeholder —
+        the actual ZoneCounter must be constructed here using zone_rect_roi.
+        The previous fix called _init_zone() correctly but then checked
+        `if use_zone and zone_obj is not None:` which was always False (zone_obj
+        is always None from _init_zone), so _zone_obj was never set and zone
+        counting NEVER worked in the threaded pipeline.  Fixed by creating the
+        ZoneCounter directly from zone_rect_roi when use_zone is True.
+
+        BUG-02 fix: the call-site used getattr(self.args, "use_zone", False) but
+        "use_zone" is not an ARGS attribute.  The correct check is
+        self.args.count_mode == "zone", which is what _init_zone() also uses.
+
+        BUG-41 fix: _compose_display_frames was passing hardcoded
+        use_zone=False/zone=None to _compose_frames, so the zone overlay was
+        never drawn.  Cached zone state is now used via self._use_zone /
+        self._zone_obj / self._zone_rect_* (set here, consumed below).
+        """
+        if not self._zone_inited:
+            try:
+                # _init_zone returns (use_zone, zone=None, zone_rect_roi, zone_rect_full)
+                # zone is always None — ZoneCounter must be created here from rect.
+                use_zone, _zone_placeholder, zone_rect_roi, zone_rect_full = _init_zone(
+                    self.args, rw, rh, rx, ry
+                )
+                if use_zone and zone_rect_roi is not None:
+                    zone_obj = ZoneCounter(
+                        rect_roi_xyxy=zone_rect_roi,
+                        born_inside_policy=getattr(self.args, "zone_born_inside", "count_entry"),
+                        backfill_wait_frames=getattr(self.args, "zone_backfill_wait", 4),
+                        near_border_px=getattr(self.args, "zone_near_border_px", 24),
+                        quiet=getattr(self.args, "quiet", False),
+                    )
+                    self._use_zone = True
+                    self._zone_obj = zone_obj
+                    self._zone_rect_roi = zone_rect_roi
+                    self._zone_rect_full = zone_rect_full
+                    log.info(
+                        "DISPLAY-WORKER",
+                        f"ZoneCounter initialized: rect_roi={zone_rect_roi}",
+                    )
+                self._zone_inited = True
+            except Exception:
+                log.debug("DISPLAY-WORKER", "Zone init failed or skipped")
+                self._zone_inited = True
+        return (
+            self._use_zone,
+            self._zone_obj,
+            self._zone_rect_roi,
+            self._zone_rect_full,
+        )
+
     # ---------------- per-frame helpers ----------------
     def _extract_result_fields(self, res: dict):
         """Extract commonly used fields from a result dict with safe fallbacks."""
@@ -565,7 +630,7 @@ class DisplayWorker(threading.Thread):
         return frame, roi, feeder, frame_in, out_idx, dets
 
     def _prepare_frame_context(self, res: dict, frame, roi):
-        """Prepare drawing, geometry, lines, and dual-line state for this frame."""
+        """Prepare drawing, geometry, lines, dual-line, and zone state for this frame."""
         sample_for_drawing = frame if frame is not None else roi
         self._ensure_drawing(sample_for_drawing)
 
@@ -573,6 +638,10 @@ class DisplayWorker(threading.Thread):
         lines_roi, lines_full = self._ensure_lines(rx, ry, rw, rh)
         use_dual, dual_obj, lineA_roi, lineB_roi, lineA_full, lineB_full = (
             self._ensure_dual(rx, ry, rw, rh)
+        )
+        # BUG-01/BUG-02 fix: initialize zone on first frame (lazy, cached)
+        use_zone, zone_obj, zone_rect_roi, zone_rect_full = self._ensure_zone(
+            rx, ry, rw, rh
         )
         return (
             rx,
@@ -589,6 +658,10 @@ class DisplayWorker(threading.Thread):
             lineB_roi,
             lineA_full,
             lineB_full,
+            use_zone,
+            zone_obj,
+            zone_rect_roi,
+            zone_rect_full,
         )
 
     def _apply_counting(
@@ -604,13 +677,18 @@ class DisplayWorker(threading.Thread):
         lineA_full,
         lineB_roi,
         lineB_full,
+        use_zone=False,
+        zone_obj=None,
     ):
         """Run the appropriate counting mode for this frame."""
         try:
-            if getattr(self.args, "use_zone", False):
+            # BUG-02 fix: was getattr(self.args, "use_zone", False) — "use_zone"
+            # does not exist in ARGS.  Correct check is use_zone flag from _ensure_zone().
+            # BUG-01 fix: zone_obj was always None; now the real ZoneCounter is passed.
+            if use_zone and zone_obj is not None:
                 process_frame_zone(
                     dets,
-                    None,
+                    zone_obj,
                     feeder,
                     fps,
                     self.args,
@@ -692,6 +770,9 @@ class DisplayWorker(threading.Thread):
                     else (255 * np.ones((rh, rw, 3), dtype=np.uint8))
                 )
             )
+            # BUG-41 fix: use_zone/zone/zone_rect_* were hardcoded to False/None,
+            # so the zone rectangle overlay was never drawn.  Use the cached zone
+            # state that _ensure_zone() populated during counting setup above.
             roi_disp, full_disp = _compose_frames(
                 roi_frame=roi_frame,
                 dets=dets,
@@ -710,10 +791,10 @@ class DisplayWorker(threading.Thread):
                 colorer=self.colorer,
                 args=self.args,
                 pretty_cfg=self.pretty_cfg,
-                use_zone=getattr(self.args, "use_zone", False),
-                zone=None,
-                zone_rect_roi=None,
-                zone_rect_full=None,
+                use_zone=self._use_zone,
+                zone=self._zone_obj,
+                zone_rect_roi=self._zone_rect_roi,
+                zone_rect_full=self._zone_rect_full,
                 use_dual=use_dual,
                 lineA_roi=lineA_roi,
                 lineB_roi=lineB_roi,
@@ -796,6 +877,7 @@ class DisplayWorker(threading.Thread):
                                 full_disp,
                                 getattr(self.args, "source", None),
                                 getattr(feeder, "out_index", None),
+                                getattr(self.args, "run_root", None),
                             )
                         elif isinstance(cmd, dict) and cmd.get("cmd") == "quit":
                             # Just signal stop; browser will see stream stop
@@ -969,6 +1051,10 @@ class DisplayWorker(threading.Thread):
                     lineB_roi,
                     lineA_full,
                     lineB_full,
+                    use_zone,
+                    zone_obj,
+                    zone_rect_roi,
+                    zone_rect_full,
                 ) = self._prepare_frame_context(res, frame, roi)
 
                 # run counting/tracking logic (same as run_original)
@@ -989,6 +1075,8 @@ class DisplayWorker(threading.Thread):
                     lineA_full,
                     lineB_roi,
                     lineB_full,
+                    use_zone=use_zone,
+                    zone_obj=zone_obj,
                 )
 
                 # Decide HUD mode

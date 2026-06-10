@@ -37,7 +37,17 @@ def _prepare_geometry(cap, XR, YR, WR, HR):
 
 
 def _build_lines(count_line_roi_str, rx, ry, rw, rh):
-    """Parse COUNT_LINE_ROI and return (lines_roi, lines_full)."""
+    """
+    Parse COUNT_LINE_ROI string and return (lines_roi, lines_full).
+
+    BUG-07 fix: when count_mode == "zone" no line ROI is configured, so
+    count_line_roi_str is None.  Calling None.strip() raises AttributeError
+    and crashes the geometry init path.  Guard up-front and return empty
+    lists — zone mode simply does not use counting lines.
+    """
+    # BUG-07: guard against None / empty string (zone mode has no line ROI)
+    if not count_line_roi_str:
+        return [], []
     lines_roi, lines_full = [], []
     for line_str in count_line_roi_str.strip().split(";"):
         if not line_str.strip():

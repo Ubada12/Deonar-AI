@@ -196,12 +196,16 @@ def load_model_threaded(
                 log.debug("MODEL-LOADER", "fuse traceback:", exc_info=True)
 
             # 3) Convert to FP16 only if CUDA is in use (optional and guarded)
+            # BUG-09 fix: the original condition included `and fuse`, which meant
+            # half-precision was silently skipped whenever fuse=False (e.g. when
+            # the user disables layer fusion for debugging).  FP16 and layer-fusion
+            # are independent inference optimizations — half is controlled solely
+            # by the `half` config flag, not by whether Conv+BN fusion was applied.
             try:
                 if (
                     effective_device is not None
                     and str(effective_device).startswith("cuda")
                     and half
-                    and fuse
                 ):
                     # Only attempt half() on CUDA devices
                     if hasattr(model, "model") and model.model is not None:

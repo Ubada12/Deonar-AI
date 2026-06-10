@@ -111,12 +111,16 @@ def put_hud_enhanced(
     )
     mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     mask_bool = (mask_gray > 0).astype(np.uint8)[:, :, None]
-    img[by1:by2, bx1:bx2] = (
-        img[by1:by2, bx1:bx2]
-        * (1 - alpha * mask_bool[by1 - by1 : by2 - by1, bx1 - bx1 : bx2 - bx1])
-        + overlay[by1:by2, bx1 : bx1 + (bx2 - bx1)]
-        * (alpha * mask_bool[by1 - by1 : by2 - by1, bx1 - bx1 : bx2 - bx1])
-    ).astype(np.uint8)
+    # Blend using uint16 intermediates instead of float64 to cut peak memory
+    # for this small overlay region by ~4x (avoids transient
+    # ArrayMemoryError under fragmentation pressure).
+    alpha_u8 = np.uint8(round(alpha * 255))
+    region_mask = mask_bool[by1 - by1 : by2 - by1, bx1 - bx1 : bx2 - bx1]
+    alpha_mask = (region_mask * alpha_u8).astype(np.uint16)
+    region_img = img[by1:by2, bx1:bx2].astype(np.uint16)
+    region_ov = overlay[by1:by2, bx1 : bx1 + (bx2 - bx1)].astype(np.uint16)
+    blended = (region_img * (255 - alpha_mask) + region_ov * alpha_mask) // 255
+    img[by1:by2, bx1:bx2] = blended.astype(np.uint8)
     border = img.copy()
     _rounded_rect(border, (x1, y1), (x2, y2), (40, 40, 40), radius=radius, thickness=1)
     cv2.addWeighted(border, 0.18, img, 0.82, 0, img)

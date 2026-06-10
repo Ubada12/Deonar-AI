@@ -398,6 +398,12 @@ Supported capabilities include:
 
 # Installation
 
+### Requirements
+
+- **Python 3.10+** (enforced by the installer; earlier versions are rejected)
+- NVIDIA GPU with CUDA recommended for real-time inference
+- See `requirements.txt` for full dependency list
+
 ### Recommended Setup
 
 ```bash
@@ -418,19 +424,54 @@ pip install -e .
 
 ### Enhanced Installer
 
-The project includes an enhanced installer capable of:
+`pip install -e .` registers a `setup-installer` command that does more than plain `pip install -r requirements.txt`. It:
 
-* CUDA detection
-* PyTorch installation
-* NVIDIA monitoring dependencies
-* Environment validation
+* Detects your GPU/driver via `nvidia-smi` and picks a matching PyTorch (CUDA) build automatically
+* Detects whether your machine has a display (headless server vs desktop) and installs the correct OpenCV variant — `opencv-python` (GUI) or `opencv-python-headless` — without letting the two fight over the `cv2` module
+* Checks ffmpeg availability on PATH (Windows/macOS/Linux)
+* Skips anything that's already correctly installed, and retries failed installs
+* Writes an install log + metrics JSON to `./logs/`
+
+Requires **Python 3.10+**.
+
+#### Quick start (recommended — one command does everything)
 
 ```bash
 setup-installer \
+  --auto-detect-torch \
+  --force-reinstall \
   --install-cuda-python \
   --install-nvidia-ml \
-  --auto-detect-torch
+  --retries 3 \
+  --run-after python main.py --source rtsp://your-stream-url
 ```
+
+This will: detect your CUDA version → install/repair the matching PyTorch trio →
+install `cuda-python` + `nvidia-ml-py` for GPU monitoring → install/repair OpenCV
+for your machine → install all remaining project dependencies → and, only if
+everything succeeded, immediately launch `main.py` with your stream.
+
+#### Preview only (no changes made)
+
+```bash
+setup-installer --auto-detect-torch --force-reinstall --dry-run
+```
+
+#### Other useful flags
+
+| Flag | What it does |
+| --- | --- |
+| `--auto-detect-torch` | Detects CUDA and installs a matching PyTorch build (or CPU build if no GPU) |
+| `--force-reinstall` | Uninstalls and reinstalls torch/torchvision/torchaudio if mismatched or broken |
+| `--torch-version X --torchvision-version Y --torchaudio-version Z --cuda-tag cuXXX` | Pin exact versions instead of auto-detecting |
+| `--install-cuda-python` | Installs `cuda-python` bindings |
+| `--install-nvidia-ml` | Installs `nvidia-ml-py` (GPU monitoring) |
+| `--no-deps` | Pass `--no-deps` to all pip installs |
+| `--retries N` | Retry failed installs (default 3) |
+| `--run-after <cmd...>` | Run a command (e.g. `python main.py --source ...`) after a successful install |
+| `--dry-run` | Show the planned install queue without installing anything |
+| `--verbose` / `--always-progress` | Show raw pip output |
+
 ## ⚠️ Warning
 
 * Before running the application, download the required detection model from the HuggingFace repository and place the model file inside the `models/` directory. The application does not automatically download model weights, so this step is required for successful inference.

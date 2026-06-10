@@ -102,9 +102,32 @@ def importable(module_name: str) -> bool:
 
 
 def package_already_present(spec: str) -> bool:
-    """Heuristic: given a pip spec like 'numpy>=1.26.0', decide if installed."""
+    """
+    Heuristic: given a pip spec like 'numpy>=1.26.0', decide if installed.
+
+    BUG-32 fix: several packages have a different PyPI distribution name vs their
+    importable Python module name.  Without the mapping, importable() returns False
+    even when the package is present, so the installer reinstalls them on every run.
+
+    Added mappings:
+      - opencv-python / opencv-python-headless  -> cv2
+      - python-dotenv                           -> dotenv
+      - nvidia-ml-py                            -> pynvml
+      - pyyaml                                  -> yaml
+      - pillow                                  -> PIL  (was already here as Pillow)
+    """
     token = spec.split()[0].split("=")[0].split(">")[0].strip()
-    mapping = {"Pillow": "PIL"}
+    mapping = {
+        # distribution name -> importable module name
+        "Pillow": "PIL",
+        "pillow": "PIL",
+        "opencv-python": "cv2",
+        "opencv-python-headless": "cv2",
+        "python-dotenv": "dotenv",
+        "nvidia-ml-py": "pynvml",
+        "pyyaml": "yaml",
+        "PyYAML": "yaml",
+    }
     module = mapping.get(token, token)
     if importable(module):
         return True

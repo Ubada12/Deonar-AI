@@ -212,7 +212,7 @@ def build_runtime_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
       - stride (int)
       - no_roi (bool)
       - no_full (bool)
-      - playback_speed (float)
+      - reconnect_delay (float)         # seconds to wait before RTSP reconnect attempt
     """
     runtime = cfg.get("runtime", {}) if isinstance(cfg, dict) else {}
 
@@ -267,6 +267,11 @@ def build_runtime_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     stride = _as_int(runtime.get("stride"), 1, minv=1, name="stride")
     no_roi = _as_bool(runtime.get("no_roi"), False)
     no_full = _as_bool(runtime.get("no_full"), False)
+    # BUG-29 fix: reconnect_delay was previously unconfigurable (getattr default in
+    # multi_threaded.py hardcoded 3.0 because this key was never parsed/exposed).
+    reconnect_delay = _as_float(
+        runtime.get("reconnect_delay"), 3.0, minv=0.0, name="reconnect_delay"
+    )
 
     return {
         "sync": sync,
@@ -284,6 +289,7 @@ def build_runtime_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "stride": stride,
         "no_roi": no_roi,
         "no_full": no_full,
+        "reconnect_delay": reconnect_delay,
     }
 
 
@@ -780,6 +786,14 @@ def load_config(
         30,
         minv=1,
     )
+    # BUG-29 fix: reconnect_delay parsed and validated here so it flows into ARGS
+    # and is configurable via config.yaml (was previously hardcoded as 3.0 in runner).
+    runtime_reconnect_delay = _as_float(
+        run.get("reconnect_delay") if used_yaml else None,
+        default=3.0,
+        minv=0.0,
+        name="reconnect_delay",
+    )
 
     # Counting
     counting = cfg.get("counting", {})
@@ -813,8 +827,29 @@ def load_config(
             log.error("CONFIG", f"Invalid counting.line_roi: {e}")
             raise
 
-    # zone rect
+    # zone rect + zone behaviour attrs
+    # BUG-16 / BUG-03 fix: these three zone sub-keys were parsed from CONFIG but
+    # never flattened into ARGS, so single_threaded.py crashed with AttributeError
+    # when zone mode was selected.  Parsed + validated here; added to ARGS below.
     zone = counting.get("zone", {})
+    zone_born_inside = _as_choice(
+        zone.get("born_inside") if used_yaml else None,
+        ["ignore", "count_entry"],
+        default="count_entry",
+        name="zone.born_inside",
+    )
+    zone_backfill_wait = _as_int(
+        zone.get("backfill_wait") if used_yaml else None,
+        default=4,
+        minv=0,
+        name="zone.backfill_wait",
+    )
+    zone_near_border_px = _as_int(
+        zone.get("near_border_px") if used_yaml else None,
+        default=24,
+        minv=0,
+        name="zone.near_border_px",
+    )
     zone_rect_raw = (
         zone.get("rect") if used_yaml else cfg.get("legacy_env", {}).get("ZONE_RECT")
     )
@@ -1379,8 +1414,17 @@ def load_config(
             "playback_speed": runtime_playback_speed,
             "cap_qsize": runtime_cap_qsize,
             "res_qsize": runtime_res_qsize,
-            "cap_info_wait_timeout": run.get("cap_info_wait_timeout", 6.0),
-            "cap_info_poll_interval": run.get("cap_info_poll_interval", 0.05),
+            # BUG-17 fix: use validated float (was raw run.get() with no type check).
+            "cap_info_wait_timeout": _as_float(
+                run.get("cap_info_wait_timeout"), 6.0, minv=0.0,
+                name="cap_info_wait_timeout"
+            ),
+            "cap_info_poll_interval": _as_float(
+                run.get("cap_info_poll_interval"), 0.05, minv=0.0,
+                name="cap_info_poll_interval"
+            ),
+            # BUG-29 fix: reconnect_delay now configurable via YAML.
+            "reconnect_delay": runtime_reconnect_delay,
             "no_roi": runtime_no_roi,
             "no_full": runtime_no_full,
             "save_out": runtime_save_out,
@@ -1415,6 +1459,13 @@ def load_config(
             "line_roi_str": count_line_roi_str,
             "line_roi": count_line_roi_parsed,
             "zone_rect_ratios": zone_rect_ratios,
+            # BUG-16 fix: zone sub-keys are now included in the structured CONFIG dict.
+            "zone": {
+                "born_inside": zone_born_inside,
+                "backfill_wait": zone_backfill_wait,
+                "near_border_px": zone_near_border_px,
+                "rect_ratios": zone_rect_ratios,
+            },
             "dual": {
                 "enabled": dual_enabled,
                 "mode": dual_mode,
@@ -1548,6 +1599,12 @@ def load_config(
         count_line_roi=CONFIG["counting"]["line_roi_str"],  # raw string
         count_line_roi_parsed=CONFIG["counting"]["line_roi"],  # parsed list of tuples
         zone_rect_ratios=CONFIG["counting"]["zone_rect_ratios"],
+        # BUG-16 / BUG-03 fix: zone sub-config attrs now flattened into ARGS so that
+        # single_threaded.py (and any other consumer) can access args.zone_born_inside
+        # etc. without AttributeError.  Values mirror CONFIG["counting"]["zone"].
+        zone_born_inside=CONFIG["counting"]["zone"]["born_inside"],
+        zone_backfill_wait=CONFIG["counting"]["zone"]["backfill_wait"],
+        zone_near_border_px=CONFIG["counting"]["zone"]["near_border_px"],
         # Dual-line (flat)
         dual_lines_enabled=CONFIG["counting"]["dual"]["enabled"],
         dual_mode=CONFIG["counting"]["dual"]["mode"],
@@ -1644,6 +1701,9 @@ def load_config(
         roi_hr=CONFIG.get("geometry", {}).get("roi", {}).get("hr"),
         # Colors/classes
         count_classes=CONFIG["counting"]["classes"],
+        # BUG-29 fix: reconnect_delay is now configurable via config.yaml runtime section.
+        # ThreadedVideoCapture (multi-threaded pipeline) reads this from args.
+        reconnect_delay=CONFIG["runtime"]["reconnect_delay"],
         # WebRTC
         webrtc_enable=CONFIG["webrtc"]["enable"],
         webrtc_host=CONFIG["webrtc"]["host"],

@@ -29,6 +29,7 @@ Thumbs.db
 
 # Model weights — hosted separately (HuggingFace / Google Drive)
 # Comment out the line below if you want to include weights in the repo
+models/
 models/*.pt
 
 # Allow README assets

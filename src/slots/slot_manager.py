@@ -189,11 +189,16 @@ class SlotManager:
         # -------------------------------------------------
         if self._active_slot is not None:
             if payload.slot_id == self._active_slot.slot_id:
+                # BUG-27 fix: receiving a duplicate START for the already-active
+                # slot is an idempotent operation — the UI may re-send on page reload.
+                # Raising RuntimeError here propagates as HTTP 500, which confuses
+                # operators.  Log a warning and return silently instead so the caller
+                # sees a clean success for an already-satisfied request.
                 log.warn(
                     "SLOT",
-                    f"Duplicate start ignored for active slot {payload.slot_id}",
+                    f"Duplicate start request for already-active slot {payload.slot_id}; ignoring.",
                 )
-                raise RuntimeError("Duplicate start ignored for active slot")
+                return  # idempotent — slot is already running
             raise RuntimeError(f"Slot already active: {self._active_slot.slot_id}")
 
         # -------------------------------------------------

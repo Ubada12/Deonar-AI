@@ -55,11 +55,16 @@ runtime:
 
   # queue / thread sizing
   cap_qsize: 3
-  res_qsize: 12
+  res_qsize: 5
 
   # capture startup waits (runner)
   cap_info_wait_timeout: 6.0
   cap_info_poll_interval: 0.05
+
+  # RTSP/live source reconnect behaviour (multi-threaded pipeline only)
+  # How long (seconds) to wait before retrying after a capture failure.
+  # Applies to ThreadedVideoCapture on network stream drops.
+  reconnect_delay: 3.0
 
   # UI
   no_roi: true

@@ -309,7 +309,11 @@ class DualLineCounter:
         )
 
         # ---- Phase 1.5: geometry evidence buffer ----
-        self.geometry_events = []  # List[dict]
+        # BUG-12 fix: was a plain list that grew without bound (one entry per
+        # accepted crossing, never pruned).  Replace with a bounded deque so
+        # memory usage stays constant regardless of session length.
+        # 500 recent events is more than enough for any debug/introspection use.
+        self.geometry_events: deque = deque(maxlen=500)
 
     def _dbg(self, msg: str) -> None:
         if self.debug_enabled:
@@ -388,6 +392,18 @@ class DualLineCounter:
         Returns event dict {"type":"count", "subsystem":"dual_verify", "direction":"up|down", "tid":tid} on commit
         or None otherwise.
         """
+        # BUG-13 fix: pending_A entries for tids that were never seen at line B
+        # (animal stopped, left frame, occlusion) accumulated indefinitely.
+        # Prune any pending entry whose A-flip is older than window_frames so
+        # memory is bounded to at most one entry per *active* track.
+        expired = [
+            t for t, v in self.pending_A.items()
+            if frame_idx - v["frame"] > self.window
+        ]
+        for t in expired:
+            self._dbg(f"pruning stale pending_A for tid={t} (expired at frame {frame_idx})")
+            del self.pending_A[t]
+
         sA = self._side_sign(cx, cy, self.A, margin_px)
         sB = self._side_sign(cx, cy, self.B, margin_px)
 

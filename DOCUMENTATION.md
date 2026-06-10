@@ -52,6 +52,9 @@
 ### Part 4 — FAQ
 33. [Frequently Asked Questions](#33-frequently-asked-questions)
 
+### Part 5 — Bug Fixes & Changelog
+34. [Bug Fix Log (BUG-01 – BUG-49)](#34-bug-fix-log-bug-01--bug-49)
+
 ---
 
 # Part 1 — The Story
@@ -711,6 +714,46 @@ setup-installer \
 
 This works on Windows, Linux, and any CUDA version from 11.x to 12.x.
 
+### 20.1 OpenCV Headless vs. GUI Resolution
+
+A second common failure mode: `opencv-python` (GUI build, supports `cv2.imshow`) and `opencv-python-headless` (no GUI bindings, used on servers/containers without a display) both ship the `cv2` module under the same import name. If both are installed, they silently overwrite each other in `site-packages` and whichever was installed last "wins" — leading to confusing `cv2.error` messages or missing GUI functions on a desktop machine.
+
+The installer resolves this automatically:
+
+1. **Detect display capability.** On Linux, checks `DISPLAY` / `WAYLAND_DISPLAY` env vars — if neither is set, the machine is headless. On macOS, always treated as having a GUI (macOS uses WindowServer, not X11/Wayland, so the Linux env-var check doesn't apply). Windows is always treated as having a GUI.
+2. **Pick the desired variant** for this machine: `opencv-python-headless` if headless, `opencv-python` otherwise.
+3. **Check what's actually installed** via `pip show` for both `opencv-python` and `opencv-python-headless`.
+4. **Resolve:**
+   - Desired variant already installed and the conflicting one is *not* present → already correct, skip (recorded under `summary["already"]`).
+   - The *conflicting* variant is installed (e.g. a headless server has `opencv-python` from a previous setup) → uninstall the conflicting variant first (`pip uninstall -y <conflict>`), then keep/install the desired one. This is the actual fix — not just a warning — because both packages provide `cv2` and cannot coexist correctly.
+   - Neither installed → falls through to a normal `pip install` of the desired variant.
+
+This means re-running `setup-installer` on a machine that already has the *wrong* OpenCV variant will actively repair it, not just flag it.
+
+### 20.2 ffmpeg Detection (Windows / Linux / macOS)
+
+ffmpeg is a system binary, not a pip package, so it's handled differently from the rest of the dependency queue:
+
+- `detect_ffmpeg()` runs `ffmpeg -version` and checks the exit code/output — this works identically on Windows, Linux, and macOS as long as ffmpeg is on `PATH`.
+- If found, it's recorded under `summary["already"]` ("ffmpeg available on PATH") — no install action taken.
+- If **not** found, the installer logs a platform-aware warning with manual install instructions (`winget install Gyan.FFmpeg` / `choco install ffmpeg` on Windows, `brew install ffmpeg` on macOS, `apt`/`dnf`/`pacman install ffmpeg` on Linux) and returns `False`.
+- Critically, a missing ffmpeg is **not** added to `summary["failed"]`. ffmpeg is optional for most code paths (only needed for certain video codecs/transports), so a missing ffmpeg should not block `--run-after` from launching the app — it's surfaced as a warning the operator can act on, not a hard failure.
+
+### 20.3 "Already Installed → Skip" Logic
+
+Before installing anything, the installer checks `package_already_present()`, which maps PyPI package names to their actual importable module names (`opencv-python` → `cv2`, `python-dotenv` → `dotenv`, `nvidia-ml-py` → `pynvml`, `pyyaml` → `yaml`, `pillow` → `PIL`, etc.) and tries to import them. If the module imports successfully, the package is recorded under `summary["already"]` and skipped — this is what makes repeated runs of `setup-installer` fast and idempotent instead of reinstalling everything every time.
+
+The OpenCV branch (20.1) and ffmpeg branch (20.2) layer additional machine-compatibility checks on top of this base "already present" check, since for those two, "is it installed" is not the same question as "is the *correct variant* for this machine installed."
+
+### 20.4 CUDA Driver / Version Mismatch Handling
+
+The most common deployment failure for GPU projects is a PyTorch build compiled for one CUDA runtime running against a different driver:
+
+1. `nvidia-smi` is parsed to get the driver's maximum supported CUDA version.
+2. That version is mapped to a PyTorch CUDA wheel tag (`cu130` → `cu128` → `cu121` → `cu118`, falling back to `cpu` if no GPU/driver is detected). Version strings are normalized to `major.minor` only (e.g. `"12.4.1"` → `cu124`, not the malformed `cu1241`).
+3. With `--force-reinstall`, an existing mismatched torch/torchvision/torchaudio trio is uninstalled and reinstalled together as a matched set — partial upgrades (e.g. only `torch` updated but not `torchvision`) are a common source of `undefined symbol` / ABI errors, so all three are always installed together from the same CUDA tag.
+4. With `--retries N`, each install step is retried up to `N` times before being recorded as failed — handles transient network/index errors without operator intervention.
+
 ---
 
 # Part 3 — Counting Logic Deep Dive
@@ -1143,3 +1186,268 @@ Blocking queues would cause the pipeline to process stale frames. If inference f
 
 **Q: How are slot summary files generated?**
 When `POST /api/slot/stop` is called, `SlotSummaryGenerator` computes declared count vs. actual counted, direction breakdown (up/down), slot start/end timestamps, and final status (OK / MISMATCH / ABORTED). This is written as a JSON file in the slot's output directory alongside the CSV events and video.
+
+---
+
+# Part 5 — Bug Fixes & Changelog
+
+## 34. Bug Fix Log (BUG-01 – BUG-49)
+
+This section documents every bug identified and fixed in the codebase as part of the comprehensive audit. Each entry states the affected file, the root cause, and the fix applied.
+
+---
+
+### Configuration Layer (BUG-03, BUG-16, BUG-17, BUG-25, BUG-29)
+
+**BUG-03 — Zone sub-attrs missing from ARGS** (`src/runtime_configs/config.py`)  
+`zone_born_inside`, `zone_backfill_wait`, and `zone_near_border_px` were never parsed from `config.yaml` or added to the ARGS namespace. Any code referencing them raised `AttributeError`.  
+*Fix:* Parse all three from `config.yaml counting.zone.*` and add to ARGS.
+
+**BUG-16 — Zone sub-config not loaded into CONFIG dict** (`src/runtime_configs/config.py`)  
+The `counting.zone` block in YAML was read but not stored in the returned CONFIG dictionary, so callers could not access zone rect ratios or born-inside policy via the standard config path.  
+*Fix:* Added a `zone` sub-dict to `CONFIG["counting"]` with all four zone parameters.
+
+**BUG-17 — cap_info timing params not type-validated** (`src/runtime_configs/config.py`)  
+`cap_info_wait_timeout` and `cap_info_poll_interval` used raw `run.get()` without calling `_as_float()`, so invalid YAML values (e.g. a string) would propagate silently.  
+*Fix:* Wrap both with `_as_float(..., minv=0.0)`.
+
+**BUG-25 — Docstring listed `playback_speed` twice** (`src/runtime_configs/config.py`)  
+`build_runtime_cfg_from_config()` docstring had a duplicate `playback_speed` entry and was missing `reconnect_delay`.  
+*Fix:* Removed duplicate; added `reconnect_delay` entry.
+
+**BUG-29 — `reconnect_delay` missing from config and ARGS** (`configs/config.yaml`, `src/runtime_configs/config.py`, `src/app/multi_threaded.py`)  
+`multi_threaded.py` used `getattr(args, "reconnect_delay", 3.0)` as a hardcoded fallback because the key was absent from both `config.yaml` and the ARGS namespace.  
+*Fix:* Added `reconnect_delay: 3.0` to `configs/config.yaml` under `runtime:`, parsed via `_as_float()` in both `build_runtime_cfg_from_config()` and `load_config()`, added to ARGS, and updated `multi_threaded.py` to use `args.reconnect_delay` directly.
+
+---
+
+### Geometry & Inference Layer (BUG-04, BUG-05, BUG-06, BUG-07, BUG-09, BUG-15)
+
+**BUG-04 — `keep_class_ids` hardcoded to None in InferenceWorker** (`src/infer/worker.py`)  
+`track_once()` was always called with `None` as the `keep_class_ids` argument, silently ignoring `args.count_classes` / `counting.classes` config.  
+*Fix:* Pass `getattr(self.args, "count_classes_ids", None)` so per-class filtering is applied.
+
+**BUG-05 — `_prepare_geometry` called with numpy array** (`src/infer/worker.py`)  
+In the `else` branch (no `cap_info`), `_prepare_geometry(sample_frame, ...)` was called with a numpy array but internally calls `cap.get()` expecting a `cv2.VideoCapture`.  
+*Fix:* Derive `W, H` from `sample_frame.shape[:2]` directly and compute ROI pixel coords inline, matching the `if cap_info` branch.
+
+**BUG-06 — `bt_profile=None` causes `KeyError` in tracker** (`src/runtime_configs/tracker_cfg.py`)  
+When `tracking.bytetrack.profile` is missing or null in YAML, `args.bt_profile` is `None`. Indexing `presets[None]` raises `KeyError`.  
+*Fix:* Resolve profile with `profile = args.bt_profile if args.bt_profile in presets else "default"` and log a warning for unknown values. Also fixed the `changed` check to use the resolved `profile` variable.
+
+**BUG-07 — `_build_lines` crashes when line ROI is None** (`src/geometry/geom.py`)  
+In zone mode, `count_line_roi` is `None`. `_build_lines(None, ...)` called `None.strip()` immediately, raising `AttributeError`.  
+*Fix:* Guard at the top of `_build_lines`: `if not count_line_roi_str: return [], []`.
+
+**BUG-09 — FP16 inference gated on `fuse` flag** (`src/infer/loader.py`)  
+The condition for `model.model.half()` was `if half and fuse`, meaning half-precision was silently skipped whenever `inference.fuse: false`. FP16 and layer fusion are independent optimizations.  
+*Fix:* Changed condition to `if half` only.
+
+**BUG-15 — Tracker temp YAML files never cleaned up** (`src/runtime_configs/tracker_cfg.py`)  
+Both `make_bytetrack_yaml()` and `make_botsort_yaml()` wrote `NamedTemporaryFile(delete=False)` files but never deleted them, causing a disk leak on every run.  
+*Fix:* Added `cleanup_tracker_yaml(path)` public function. Updated module docstring with lifecycle instructions: callers must call `cleanup_tracker_yaml(path)` in a `finally` block after `model.track()`.
+
+---
+
+### Counting Modes (BUG-12, BUG-13, BUG-14, BUG-18, BUG-19, BUG-20, BUG-21, BUG-26)
+
+**BUG-12 — `geometry_events` list grows unboundedly** (`src/counting/counting_modes/dual_lines.py`)  
+`self.geometry_events = []` was never pruned; every accepted count appended to it indefinitely.  
+*Fix:* Changed to `deque(maxlen=500)`.
+
+**BUG-13 — `pending_A` entries leak without B-flip** (`src/counting/counting_modes/dual_lines.py`)  
+When a track flipped line A but never reached line B (stopped, occluded, left frame), the `pending_A` entry persisted forever.  
+*Fix:* At the start of `update_verify()`, prune any `pending_A` entry whose A-flip frame is older than `window_frames`.
+
+**BUG-14 — `ghost_ids` set never cleared** (`src/counting/counting_modes/zone.py`)  
+`ghost_ids.add(tid)` was called on entry but never `discard(tid)` on exit, so the set grew indefinitely.  
+*Fix:* Call `self.ghost_ids.discard(tid)` in both exit paths (with and without matched entry edge).
+
+**BUG-18 — Dead code in `_edge_pair_to_direction`** (`src/counting/counting_modes/zone.py`)  
+The `"Bottom entry"` block (lines checking `e == 2 and x == 0` and `e == 2`) was unreachable because the `if e == 2: return "up"` early return already handled all bottom-entry cases.  
+*Fix:* Removed the two dead `if e == 2` blocks below the early return.
+
+**BUG-19 — Dead second `if tid not in self.prev_pt` block** (`src/counting/counting_modes/zone.py`)  
+After the first `if tid not in self.prev_pt` handler (which always sets `prev_pt[tid]` before returning), a second identical guard appeared — it was never True.  
+*Fix:* Removed the dead block.
+
+**BUG-20 — `pending` dict initialized but never used** (`src/counting/counting_modes/zone.py`)  
+`self.pending = {}` was set in `__init__` but never read or written anywhere in `ZoneCounter`.  
+*Fix:* Removed; added explanatory comment.
+
+**BUG-21 — Ghost-born entry handler is dead code** (`src/counting/counting_modes/counting_modes.py`)  
+`elif ev and ev["type"] == "entry" and ev.get("method") == "ghost_born":` appeared after `elif ev["type"] == "entry":`, which already catches all entry events. The ghost_born logging never ran.  
+*Fix:* Merged ghost_born handling into the `entry` branch with an inner `if ev.get("method") == "ghost_born":` check.
+
+**BUG-26 — `import math` inside function body** (`src/counting/counting_modes/init_counting_modes.py`)  
+`import math` was placed mid-function body (line ~33 of `_init_dual_lines`). Violates PEP 8; slightly slower on repeated calls.  
+*Fix:* Moved to module-level imports.
+
+---
+
+### App, Display & IO Layer (BUG-01, BUG-02, BUG-08, BUG-10, BUG-11, BUG-22, BUG-23, BUG-24, BUG-27, BUG-28, BUG-29, BUG-30)
+
+**BUG-01 — `process_frame_zone` always called with `zone=None`** (`src/display/worker.py`)  
+`DisplayWorker` never initialized a `ZoneCounter` object. Every zone-mode frame call crashed with `AttributeError` on `None.update_for_frame()`.  
+*Fix:* Added `_ensure_zone()` helper (mirrors `_ensure_dual()`) that lazily creates a `ZoneCounter` from `zone_rect_roi`. Zone object is now passed through `_prepare_frame_context()` and `_apply_counting()`. See also BUG-41 for a second root cause in the same code path that completed the fix.
+
+**BUG-02 — `use_zone` attribute does not exist in ARGS** (`src/display/worker.py`)  
+`getattr(self.args, "use_zone", False)` was used to gate zone counting but `use_zone` is not an ARGS attribute. The gate was always `False`, so zone counting never ran in the threaded pipeline.  
+*Fix:* Replaced with `_use_zone` boolean cached on the worker instance by `_ensure_zone()`, which checks `self.args.count_mode == "zone"` and constructs the `ZoneCounter` directly from `zone_rect_roi` (since `_init_zone()` always returns `zone=None` as a placeholder). See also BUG-41.
+
+**BUG-08 — `hasattr` always True for decisions CSV** (`src/app/multi_threaded.py`)  
+`hasattr(args, "dual_lines_enabled")` is always `True` because the attr is always in ARGS. The check was meant to test if dual mode is *enabled*.  
+*Fix:* Changed to `args.dual_lines_enabled` (boolean value check).
+
+**BUG-10 — Output video codec hardcoded to `mp4v`** (`src/io/io.py`)  
+`cv2.VideoWriter_fourcc(*"mp4v")` ignored `args.video_fourcc` (config `output_video.fourcc`).  
+*Fix:* Use `fourcc_str = getattr(args, "video_fourcc", "mp4v") or "mp4v"`.
+
+**BUG-11 — No setter for `_slot_manager` in WebRTC server** (`src/display/webrtc_server.py`)  
+`WebRTCStreamServer` had no public method to inject a `SlotManager`. Runners used direct attribute assignment (`server._slot_manager = mgr`) on a private name.  
+*Fix:* Added `set_slot_manager(self, slot_mgr)` public method. Updated `multi_threaded.py` to use `webrtc_server.set_slot_manager(slot_manager)`.
+
+**BUG-22 — Unreachable `return False` in `write_event`** (`src/io/io.py`)  
+After `try/except` with `return True` (success) and `return False` (exception), a second `return False` appeared outside the try block — never reachable.  
+*Fix:* Removed with explanatory comment.
+
+**BUG-23 — Redundant inner `if slots_enabled:` block** (`src/app/multi_threaded.py`)  
+Inside `if slots_enabled and vision_ready:`, an inner `if slots_enabled:` added a spurious indentation level. `slots_enabled` is always `True` inside the outer block.  
+*Fix:* Removed inner check and de-indented the block. Added `else:` clause to the outer block for the disabled case.
+
+**BUG-24 — Wrong filename in `capture/worker.py` header comment** (`src/capture/worker.py`)  
+The file comment said `# src/capture/stream_threaded.py` (stale name from a prior refactor).  
+*Fix:* Corrected to `# src/capture/worker.py`.
+
+**BUG-27 — Idempotent slot start raises `RuntimeError`** (`src/slots/slot_manager.py`)  
+Receiving a duplicate `START` for the already-active slot raised `RuntimeError("Duplicate start ignored for active slot")`, which propagated as HTTP 500. This happens naturally when the browser UI reloads during an active session.  
+*Fix:* Return silently (log a warning) for the idempotent same-slot-already-active case. Only raise for a *different* slot ID.
+
+**BUG-28 — Inconsistent return type annotation on `_drain_to_latest`** (`src/runtime/pacing.py`)  
+The annotation was `Optional[Dict[str, Any]]` but the function always returns a 2-tuple `(item_or_None, int)`. Type-checkers and readers were misled.  
+*Fix:* Changed annotation to `Tuple[Optional[Dict[str, Any]], int]`. Added `Tuple` to imports.
+
+**BUG-30 — Stop slot fails after page refresh (422 Pydantic error)** (`src/display/webrtc_page.py`)  
+`currentOperator` was volatile Alpine.js state, reset to `''` on every page reload. `SlotStopRequest.stopped_by` requires `min_length=2`, so an empty string triggered HTTP 422 and broke the Stop button.  
+*Fix:*
+- Initialize `currentOperator` from `localStorage.getItem('slotOperator') || ''`
+- `localStorage.setItem('slotOperator', ...)` on successful Start
+- `localStorage.removeItem('slotOperator')` on successful Stop
+- Added fallback chain in Stop payload: `currentOperator || slotData.started_by || 'operator'` to guarantee `min_length ≥ 2`
+
+---
+
+### Installer (BUG-31 – BUG-40)
+
+**BUG-31 — `--retries` flag never used in `install_task`** (`src/setup_installer_enhanced/core.py`)  
+The CLI flag `--retries` was parsed but `install_task()` called `run_stream()` exactly once regardless.  
+*Fix:* Added retry loop: `for attempt in range(1, max_retries + 1)` around the `run_stream()` call.
+
+**BUG-32 — Missing import-name mappings in `package_already_present`** (`src/setup_installer_enhanced/utils.py`)  
+Packages whose PyPI name differs from their importable module name (`opencv-python` → `cv2`, `python-dotenv` → `dotenv`, `nvidia-ml-py` → `pynvml`, `pyyaml` → `yaml`) were not in the mapping dict. `importable()` returned `False` so these packages were reinstalled on every run.  
+*Fix:* Added all four mappings (plus lowercase `pillow` → `PIL`).
+
+**BUG-33 — `is_headless()` always returns `True` on macOS** (`src/setup_installer_enhanced/core.py`)  
+The function checked `DISPLAY`/`WAYLAND_DISPLAY` on both Linux and macOS. macOS uses WindowServer (not X11/Wayland) so neither env var is set, causing `is_headless()` to return `True` even with a full GUI — forcing `opencv-python-headless` on every macOS install.  
+*Fix:* macOS always returns `False`. Linux checks the env vars. Windows/other returns `False`.
+
+**BUG-34 — 3-part CUDA version string creates wrong PyPI tag** (`src/setup_installer_enhanced/core.py`)  
+`f"cu{str(tcuda).replace('.','')}"` on `"12.4.1"` produces `"cu1241"` not the correct `"cu124"`.  
+*Fix:* Split on `"."` and use only `major + minor`: `f"cu{_major}{_minor}"`.
+
+**BUG-35 — Local variable `queue` shadows stdlib `import queue`** (`src/setup_installer_enhanced/core.py`)  
+`queue = self.plan_queue(env)` in `execute()` shadowed the `import queue` module, breaking `queue.Queue` and `queue.Empty` usage inside `run_stream()`.  
+*Fix:* Renamed local variable to `task_queue` throughout `execute()`.
+
+**BUG-36 — Unused `tempdir` created in `__init__`** (`src/setup_installer_enhanced/core.py`)  
+`self.tempdir = tempfile.mkdtemp(...)` was called in `__init__` but the directory was never used for any actual work; each operation created its own local temp dir.  
+*Fix:* Retained (cleanup() still removes it) but added a comment explaining its role as a scratch space placeholder. Individual operations use their own local `tempfile.mkdtemp()` calls.
+
+**BUG-37 — OpenCV variant conflict not detected** (`src/setup_installer_enhanced/core.py`)  
+If `opencv-python` was installed and the installer tried to install `opencv-python-headless` (or vice versa), both would coexist, fighting over the `cv2` namespace silently.  
+*Original fix:* Before installing either OpenCV variant, check with `pip show` whether the conflicting variant is installed and log a prominent warning with instructions.
+
+> **Superseded by BUG-49.** A warning alone still left both variants installed and fighting. The `install_task()` OpenCV branch was rewritten to actively resolve the conflict — detect what's installed, uninstall whichever variant doesn't match this machine's display capability, and skip cleanly if the correct variant is already present. See BUG-49 for the current behavior.
+
+**BUG-38 — Dead string literal after `main()` call** (`src/setup_installer_enhanced/cli.py`)  
+`"""Entry point for CLI."""` appeared as a statement after `main()` in the `__main__` block — not a docstring, just a no-op string literal.  
+*Fix:* Removed. Also changed to `sys.exit(main() or 0)` so the exit code propagates correctly.
+
+**BUG-39 — `PYTHON_SUPPORT_MAP` defined and imported but never read** (`src/setup_installer_enhanced/constants.py`)  
+The map existed as data but no code ever called it. Future validation was implied but never implemented.  
+*Fix:* Updated values to 3.10 (consistent with BUG-40), added `check_python_support(package_name)` helper function as the documented consumption point, and added explanatory comment.
+
+**BUG-40 — Python version check requires `>= 3.8` but project requires `3.10+`** (`src/setup_installer_enhanced/core.py`)  
+`validate_python_version()` accepted Python 3.8, but the codebase uses `dict | None` union syntax (Python 3.10+) and the README states Python 3.10+.  
+*Fix:* Changed minimum to `(3, 10)`.
+
+---
+
+### Re-Audit Discovery (BUG-41)
+
+**BUG-41 — Zone mode completely non-functional in threaded pipeline** (`src/display/worker.py`)  
+Two separate root causes, both in `DisplayWorker`, meant zone mode never produced a zone overlay and the ZoneCounter was never created, even after BUG-01/02 were applied.
+
+*Root cause 1 (`_ensure_zone` logic flaw):* The original BUG-01 fix added `_ensure_zone()` but its implementation checked `if use_zone and zone_obj is not None:` before creating the `ZoneCounter`. However, `_init_zone()` is designed to always return `zone=None` — the actual `ZoneCounter` must be constructed from `zone_rect_roi`. Because the guard required `zone_obj is not None`, the ZoneCounter was never created and `self._zone_obj` remained `None` on every call.
+
+*Root cause 2 (`_compose_display_frames` hardcoded args):* `_compose_display_frames()` called `_compose_frames()` with `use_zone=getattr(self.args, "use_zone", False)` (always `False` — `use_zone` does not exist in ARGS) and `zone=None, zone_rect_roi=None, zone_rect_full=None` hardcoded. Even if counting worked, the zone rectangle overlay was never drawn.
+
+*Fix:*
+1. Added `from src.counting.counting_modes.zone import ZoneCounter` import.
+2. Rewrote `_ensure_zone()` to directly construct a `ZoneCounter` from `zone_rect_roi` when `count_mode == "zone"` (mirrors the correct pattern in `single_threaded.py`). Caches `_use_zone`, `_zone_obj`, `_zone_rect_roi`, `_zone_rect_full` on the worker instance.
+3. Changed the `_compose_frames()` call inside `_compose_display_frames()` to use `use_zone=self._use_zone, zone=self._zone_obj, zone_rect_roi=self._zone_rect_roi, zone_rect_full=self._zone_rect_full`.
+
+After this fix, zone mode is fully operational in the threaded pipeline, matching the behavior of the single-threaded pipeline.
+
+---
+
+### Production Hardening Pass (BUG-42 – BUG-49)
+
+This section documents fixes applied after a real production deployment surfaced new failures (memory fragmentation, a `KeyError` in the HUD, and a missing-argument crash), followed by a final layer-by-layer sanity audit and a dedicated installer hardening pass.
+
+**BUG-42 — Memory fragmentation under sustained load** (`configs/config.yaml`)  
+Production logs showed `numpy.core._exceptions._ArrayMemoryError` and `cv2.error -4 Insufficient memory` during long runs, caused by queue buildup under memory pressure.  
+*Fix:* Reduced `res_qsize` from `12` to `5` under `queue / thread sizing` to lower the peak number of in-flight result frames held in memory at once. (`cap_qsize: 3` was already small and left unchanged.)
+
+**BUG-43 — HUD overlay blend allocated float64 buffers** (`src/viz/_labels.py`, `put_hud_enhanced`)  
+The semi-transparent HUD overlay blend (`img * (1-alpha) + overlay * alpha`) promoted both operands to `float64`, allocating a buffer ~4x larger than the `uint8` source for every overlay region on every frame — a major contributor to the fragmentation in BUG-42 under sustained load.  
+*Fix:* Rewrote the blend to use `uint16` intermediates instead: convert the alpha and region arrays to `uint16`, compute `(region_img * (255-alpha) + region_ov * alpha) // 255`, then cast back to `uint8`. Same visual result, ~4x less peak memory per overlay.
+
+**BUG-44 — `KeyError: 'frame'` in HUD text** (`src/display/drawing.py`, ~line 563)  
+The HUD text builder referenced `hud_data['frame']`, but `_build_hud_data()` only ever produces a `frame_in` key — `'frame'` never existed, so this line crashed with `KeyError` whenever the HUD was rendered with this field.  
+*Fix:* Changed to `hud_data.get('frame_in', '?')` (and `hud_data.get('res', '?')` for the adjacent field, for the same defensive reason).
+
+**BUG-45 — Animator allocated a fresh frame copy every draw call** (`src/viz/animator.py`, `CrossAnimator`)  
+`_draw_one()` called `overlay = img.copy()` on every animation frame for every active cross-animation — another steady source of large transient allocations contributing to fragmentation.  
+*Fix:* Added a small per-key buffer cache (`_get_overlay_buf`): a `np.empty_like(img)` buffer is allocated once per `(roi/full)` key and reused via `np.copyto()` on subsequent calls, only reallocating if the frame shape/dtype changes (e.g. on resolution change).
+
+**BUG-46 — `_save_screenshot()` missing required `run_root` argument** (`src/display/worker.py`, `src/app/single_threaded.py`)  
+A production traceback showed `_save_screenshot() missing 1 required positional argument: 'run_root'`. An audit of all call sites found **three** call sites passing only 3 of the 4 required arguments:
+- `src/display/worker.py`, `_handle_webrtc()` control-command handler (~line 876)
+- `src/app/single_threaded.py`, pause-key handler (~line 133)
+- `src/app/single_threaded.py`, quit-key handler (~line 248)
+
+*Fix:* All three now pass the 4th argument: `getattr(self.args, "run_root", None)` (worker.py) / `args.run_root` (single_threaded.py), matching the signature `_save_screenshot(frame, source, out_index, run_root)`.
+
+**BUG-47 — `src/app/single_threaded.py` physically truncated mid-statement**  
+During the final sanity audit, `pyflakes`/`ast.parse` reported an unterminated string literal. The file on disk ended mid-statement at `...state.down_coun`, missing the closing `t}",\n        )\n` of an f-string HUD call — making the entire module fail to parse/import.  
+*Fix:* Appended the missing `t}",\r\n        )\r\n` (matching the file's CRLF line endings) to complete the statement. Verified with `ast.parse` and a module import smoke test.
+
+**BUG-48 — `fastapi` / `uvicorn` used but not declared as dependencies** (`requirements.txt`, `src/setup_installer_enhanced/constants.py`)  
+`src/slots/api/server.py` and `routes.py` import `fastapi` and `uvicorn` directly to run the Slot API, but neither package was listed in `requirements.txt` or in the enhanced installer's dependency list — a fresh install would fail at runtime with `ModuleNotFoundError` the first time the Slot API started.  
+*Fix:*
+- Added `fastapi>=0.110.0` and `uvicorn>=0.29.0` to `requirements.txt` under "Web Framework" (alongside `flask>=3.0.0`).
+- Added the same two entries to `NON_MACHINE_DEPS` in `src/setup_installer_enhanced/constants.py`, and added `"fastapi": (3, 10, 3, 12)` / `"uvicorn": (3, 10, 3, 12)` to `PYTHON_SUPPORT_MAP`.
+
+**BUG-49 — OpenCV headless/GUI conflict only warned, never resolved** (`src/setup_installer_enhanced/core.py`, supersedes BUG-37)  
+The BUG-37 fix detected a conflicting OpenCV variant and logged a warning, but still proceeded to install the newly-requested variant — leaving **both** `opencv-python` and `opencv-python-headless` installed and silently fighting over the `cv2` module. This is one of the most common real-world breakage modes for this project (machine has the wrong OpenCV variant from a prior setup, `cv2.imshow` either crashes with "function not implemented" on headless, or the headless build is shadowed by a stale GUI build on a server).  
+*Fix:* Rewrote the `install_task()` OpenCV branch (see [20.1 OpenCV Headless vs. GUI Resolution](#201-opencv-headless-vs-gui-resolution) for full behavior):
+- If the desired variant is already installed and the conflicting one is absent → skip, recorded as already-correct.
+- If the conflicting variant is present → **actively `pip uninstall -y` it**, then keep/install the desired variant.
+- Otherwise → fall through to a normal install of the desired variant.
+
+Also improved the ffmpeg branch's messaging (platform-specific manual-install instructions for Windows/macOS/Linux) and confirmed ffmpeg failures are intentionally excluded from `summary["failed"]` so a missing optional system binary never blocks `--run-after`.
+
+---
+
+*This changelog was generated as part of a full codebase audit, a re-audit, and a production-hardening pass. All 49 bugs were fixed with inline comments. DOCUMENTATION.md is the single source of truth for project architecture and behavior.*

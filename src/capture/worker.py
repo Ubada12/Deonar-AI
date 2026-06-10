@@ -1,4 +1,6 @@
-# src/capture/stream_threaded.py
+# src/capture/worker.py
+# BUG-24 fix: header comment previously said "src/capture/stream_threaded.py"
+# which was an old/stale filename.  The actual module path is src/capture/worker.py.
 """
 Threaded OpenCV capture (producer).
 

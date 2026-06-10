@@ -6,15 +6,54 @@ It supports multiple trackers while preserving ByteTrack behavior.
 
 Public:
  - make_bytetrack_yaml(args, fps) -> path | None
- - make_botsort_yaml(args, fps) -> path
- - make_tracker_yaml(args, fps) -> path | None
+ - make_botsort_yaml(args, fps)   -> path
+ - make_tracker_yaml(args, fps)   -> path | None
+ - cleanup_tracker_yaml(path)     -> None   (removes temp file; call in finally)
+
+Temp-file lifecycle
+-------------------
+Both make_*_yaml() helpers write a NamedTemporaryFile with delete=False so the
+path can be handed to Ultralytics after the Python file object is closed.
+Callers MUST call cleanup_tracker_yaml(path) in a finally-block once tracking is
+complete to avoid leaving stale YAML files on disk.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from src.utils.logger import log
+
+
+# ---------------------------------------------------------------------------
+# BUG-15 fix: temp YAML files were written with delete=False and never removed,
+# causing a disk leak (one file per run, per tracker config change).
+# Callers should obtain the path via make_tracker_yaml(), use it for the
+# duration of the model.track() call, then call cleanup_tracker_yaml(path)
+# in a finally-block to remove it.
+# ---------------------------------------------------------------------------
+
+def cleanup_tracker_yaml(path: str | None) -> None:
+    """
+    Remove a temporary tracker YAML file created by make_*_yaml().
+
+    Safe to call with None (no-op) or an already-deleted path.
+    Typical usage::
+
+        yaml_path = make_tracker_yaml(args, fps)
+        try:
+            results = model.track(source, tracker=yaml_path or "bytetrack.yaml")
+        finally:
+            cleanup_tracker_yaml(yaml_path)
+    """
+    if path is None:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        # File may have already been removed or path was never written; ignore.
+        pass
 
 
 def make_bytetrack_yaml(args, fps):
@@ -51,7 +90,17 @@ def make_bytetrack_yaml(args, fps):
             mot20=False,
         ),
     }
-    cfg = presets[args.bt_profile].copy()
+    # BUG-06 fix: args.bt_profile is None when config.yaml tracking.bytetrack.profile
+    # is missing or null.  Indexing presets[None] raises KeyError.  Fall back to
+    # "default" so the system degrades gracefully instead of crashing at init.
+    profile = args.bt_profile if args.bt_profile in presets else "default"
+    if args.bt_profile is not None and args.bt_profile not in presets:
+        log.warn(
+            "TRACKER",
+            f"bt_profile '{args.bt_profile}' not recognised; falling back to 'default'. "
+            f"Valid choices: {list(presets.keys())}",
+        )
+    cfg = presets[profile].copy()
 
     # User overrides
     if args.bt_high is not None:
@@ -71,7 +120,10 @@ def make_bytetrack_yaml(args, fps):
 
     cfg["frame_rate"] = int(max(1, round(fps)))
 
-    changed = (args.bt_profile != "default") or any(
+    # BUG-06 note: use the *resolved* profile (never None) so that a missing/null
+    # bt_profile in config (which falls back to "default") does not accidentally
+    # mark the config as changed and force an unnecessary temp YAML write.
+    changed = (profile != "default") or any(
         v is not None
         for v in [
             args.bt_high,

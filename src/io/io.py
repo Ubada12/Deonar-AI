@@ -123,7 +123,11 @@ def setup_output(args, W, H, fps):
     eff_fps = max(1.0, (fps if fps and fps > 0 else 25.0) * float(speed))
 
     try:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # BUG-10 fix: codec was hardcoded to "mp4v" ignoring args.video_fourcc
+        # (config output_video.fourcc).  Now use the configured codec so users
+        # can switch to e.g. "avc1" or "xvid" without touching source code.
+        fourcc_str = getattr(args, "video_fourcc", "mp4v") or "mp4v"
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
         writer = cv2.VideoWriter(out_path, fourcc, eff_fps, (W, H))
 
         if not writer.isOpened():
@@ -234,7 +238,10 @@ class CsvWriters:
             # and SystemExit in a non-main thread only kills that thread silently.
             safe_print_error("Failed to write event row", e)
             return False
-        return False
+        # BUG-22 fix: this `return False` was unreachable dead code.  The try
+        # block always either hits `return True` (success) or falls into the
+        # `except` block which returns False.  There is no code path that exits
+        # the try/except normally and reaches here.  Removed to avoid confusion.
 
     def write_timeseries(self, sec, up, down):
         try:

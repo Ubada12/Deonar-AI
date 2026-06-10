@@ -294,13 +294,18 @@ class InferenceWorker(threading.Thread):
                 self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
                 self.roi_area = max(1, rw * rh)
             else:
-                rx, ry, rw, rh = _prepare_geometry(
-                    sample_frame,
-                    self.args.roi_xr,
-                    self.args.roi_yr,
-                    self.args.roi_wr,
-                    self.args.roi_hr,
-                )
+                # BUG-05 fix: _prepare_geometry() internally calls cap.get() on its
+                # first argument assuming it is an OpenCV VideoCapture object.  When
+                # cap_info is absent we only have sample_frame (a numpy array), so
+                # calling _prepare_geometry(sample_frame, ...) raises AttributeError.
+                # Instead, derive W/H directly from the array's shape — identical to
+                # what the if-branch above does when cap_info is available.
+                H, W = sample_frame.shape[:2]
+                rx = int(W * float(self.args.roi_xr))
+                ry = int(H * float(self.args.roi_yr))
+                rw = int(W * float(self.args.roi_wr))
+                rh = int(H * float(self.args.roi_hr))
+                rx, ry, rw, rh = clamp_roi(rx, ry, rw, rh, W, H)
                 self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
                 self.roi_area = max(1, rw * rh)
         except Exception:
@@ -434,13 +439,16 @@ class InferenceWorker(threading.Thread):
         """Run model tracking for a single ROI frame."""
         try:
             t0 = time.perf_counter()
+            # BUG-04 fix: keep_class_ids was hardcoded to None, silently ignoring
+            # args.count_classes (parsed from config counting.classes).  Pass the
+            # pre-parsed class ID list so per-class filtering actually takes effect.
             dets = track_once(
                 self.model,
                 roi,
                 self.args,
                 self.tracker_yaml,
                 self.roi_area,
-                None,
+                getattr(self.args, "count_classes_ids", None),
             )
             t1 = time.perf_counter()
             infer_time = t1 - t0

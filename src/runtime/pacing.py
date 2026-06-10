@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import threading
 import queue
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from src.utils.logger import log
 from src.utils.pacing_contract_dict import _ensure_item_dict
 
@@ -140,12 +140,19 @@ class PacingController:
             except Exception:
                 return float(time.monotonic())
 
-    def _drain_to_latest(self) -> Optional[Dict[str, Any]]:
+    def _drain_to_latest(self) -> Tuple[Optional[Dict[str, Any]], int]:
         """
-        Drain up to self._drain_limit items and return the latest item.
+        Drain up to self._drain_limit items and return (latest_item, drained_count).
+
         IMPORTANT: do NOT call task_done() here; the caller will call task_done()
         after selecting/emitting the chosen item to keep get()/task_done() balanced
         in a single place.
+
+        BUG-28 fix: the return type annotation was `Optional[Dict]` but the function
+        returns a 2-tuple in ALL code paths.  When the queue is empty it returned
+        `(None, 0)` while the non-empty path returned `(dict, int)` — consistent
+        tuple return in practice, but the stale annotation confused type-checkers and
+        readers.  Fixed annotation to `Tuple[Optional[Dict], int]` and added a note.
         """
         latest = None
         drained = 0
@@ -163,6 +170,7 @@ class PacingController:
                 f"drained {drained} frames to latest (queue may have been backlogged)",
             )
         if latest is None:
+            # Empty queue: return a consistent 2-tuple so callers can always unpack.
             return None, 0
         return _ensure_item_dict(latest), drained
 

@@ -1,6 +1,7 @@
 # src/viz/animator.py
 """Count-event animation: renders the +1 flash/trail effect on-screen when a goat crossing is confirmed."""
 import cv2
+import numpy as np
 from ..geometry.geom import project_point_to_segment
 
 
@@ -17,6 +18,17 @@ class CrossAnimator:
         self.color_up = tuple(color_up)
         self.color_down = tuple(color_down)
         self.label_mode = label_mode
+        # Reusable overlay buffers keyed by name ("roi"/"full") to avoid
+        # allocating a fresh full-frame copy on every animated draw call.
+        self._overlay_bufs = {}
+
+    def _get_overlay_buf(self, img, key):
+        buf = self._overlay_bufs.get(key)
+        if buf is None or buf.shape != img.shape or buf.dtype != img.dtype:
+            buf = np.empty_like(img)
+            self._overlay_bufs[key] = buf
+        np.copyto(buf, img)
+        return buf
 
     def trigger(self, cx, cy, line_roi, line_full, direction, frame_idx):
         ax, ay, bx, by = line_roi
@@ -41,12 +53,12 @@ class CrossAnimator:
     def _color_for(self, direction):
         return self.color_up if direction == "up" else self.color_down
 
-    def _draw_one(self, img, pt, t, direction):
+    def _draw_one(self, img, pt, t, direction, buf_key="full"):
         if img is None:
             return
         x, y = int(pt[0]), int(pt[1])
         color = self._color_for(direction)
-        overlay = img.copy()
+        overlay = self._get_overlay_buf(img, buf_key)
         r = int(8 + 22 * t)
         cv2.circle(overlay, (x, y), r, color, thickness=3, lineType=cv2.LINE_AA)
         alpha = 0.75 * (1.0 - t)
@@ -83,7 +95,7 @@ class CrossAnimator:
             if frame_idx >= item["end"]:
                 continue
             t = (frame_idx - item["start"]) / float(self.duration)
-            self._draw_one(roi_img, item["roi"], t, item["dir"])
-            self._draw_one(full_img, item["full"], t, item["dir"])
+            self._draw_one(roi_img, item["roi"], t, item["dir"], buf_key="roi")
+            self._draw_one(full_img, item["full"], t, item["dir"], buf_key="full")
             keep.append(item)
         self.active = keep

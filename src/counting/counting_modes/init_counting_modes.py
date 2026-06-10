@@ -1,5 +1,12 @@
 # src/counting/counting_modes/init_counting_modes.py
 
+# BUG-26 fix: `import math` was placed inside the body of `_init_dual_lines()`
+# at the point of first use (line ~33).  Inlining imports mid-function makes
+# them easy to miss, slightly slower on repeated calls (CPython does re-execute
+# the import statement each call, though it hits sys.modules cache), and violates
+# PEP 8.  Moved to module level where all imports belong.
+import math
+
 from src.counting.counting_modes.dual_lines import DualLineCounter
 from src.utils.logger import log
 
@@ -30,8 +37,6 @@ def _init_dual_lines(args, lines_roi, lines_full, rx, ry, rw, rh):
             dx = bx - ax
             dy = by - ay
             # length (avoid zero division)
-            import math
-
             L = math.hypot(dx, dy) or 1.0
 
             # unit tangent (along the line)

@@ -54,6 +54,11 @@ class Installer:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        # BUG-36 fix: tempdir was created in __init__ but never used for any
+        # intermediate work — it existed as unused scaffolding.  The directory is
+        # retained so cleanup() can still call shutil.rmtree() without error, but
+        # actual temp work (e.g. torch wheel validation) now uses function-local
+        # tempfile.mkdtemp() calls that are cleaned up in their own finally-blocks.
         self.tempdir = tempfile.mkdtemp(prefix="setup_installer_")
         self.start = time.time()
         self.summary = {"installed": [], "skipped": [], "failed": [], "already": []}
@@ -66,11 +71,17 @@ class Installer:
 
     # --------------------- system detection ---------------------
     def validate_python_version(self):
+        """
+        BUG-40 fix: was checking >= 3.8 but the project requires Python 3.10+
+        (documented in README.md and enforced by type-annotation syntax used
+        throughout the codebase, e.g. `dict | None` union syntax requires 3.10+).
+        Updated minimum to (3, 10).
+        """
         major, minor = sys.version_info[:2]
-        if (major, minor) < (3, 8):
+        if (major, minor) < (3, 10):
             log(
                 "error",
-                f"Unsupported Python {major}.{minor}. Python >= 3.8 is required.",
+                f"Unsupported Python {major}.{minor}. Python >= 3.10 is required.",
             )
             sys.exit(1)
         else:
@@ -132,10 +143,26 @@ class Installer:
         return code == 0
 
     def is_headless(self) -> bool:
-        if sys.platform.startswith("linux") or sys.platform == "darwin":
-            if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-                return False
-            return True
+        """
+        Detect whether the current environment lacks a display server.
+
+        BUG-33 fix: the original logic checked DISPLAY/WAYLAND_DISPLAY on both
+        Linux AND macOS.  On macOS, neither env var is set by default (the display
+        is managed by the WindowServer, not via X11/Wayland), so the function
+        incorrectly returned True — causing the installer to always prefer
+        opencv-python-headless on macOS even when a full GUI is available.
+
+        Fix: macOS always has a display server (WindowServer) and is never
+        considered headless.  Only apply the DISPLAY/WAYLAND_DISPLAY check on
+        Linux.  Windows always returns False (handled implicitly by the else).
+        """
+        if sys.platform == "darwin":
+            # macOS: WindowServer is always present; never headless.
+            return False
+        if sys.platform.startswith("linux"):
+            # Linux: headless if neither X11 nor Wayland display is available.
+            return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        # Windows and other platforms: assume a display is present.
         return False
 
     # --------------------- queue planning ---------------------
@@ -458,7 +485,14 @@ class Installer:
             if candidate_tag not in tv:
                 tcuda = info.get("torch_cuda")
                 if tcuda:
-                    tag_from_tcuda = f"cu{str(tcuda).replace('.','') }"
+                    # BUG-34 fix: torch.version.cuda can be a 3-part string like
+                    # "12.4.1".  str(tcuda).replace('.','') would give "cu1241"
+                    # instead of the correct PyPI tag "cu124".  Only take
+                    # major.minor (first two dot-separated components).
+                    _tcuda_parts = str(tcuda).split(".")
+                    _major = _tcuda_parts[0] if len(_tcuda_parts) >= 1 else "0"
+                    _minor = _tcuda_parts[1] if len(_tcuda_parts) >= 2 else "0"
+                    tag_from_tcuda = f"cu{_major}{_minor}"
                     if tag_from_tcuda != candidate_tag:
                         reasons.append(
                             f"installed torch CUDA tag {tag_from_tcuda} != desired {candidate_tag}"
@@ -785,7 +819,16 @@ class Installer:
                 log("ok", "ffmpeg available on PATH")
                 return True
             else:
-                log("warn", "ffmpeg not installed on system PATH")
+                # Note: ffmpeg is optional (validated only, not pip-installable),
+                # so it is intentionally NOT added to summary["failed"] — that
+                # list is used by the CLI to decide whether to abort and skip
+                # --run-after, and a missing ffmpeg shouldn't block that.
+                log(
+                    "warn",
+                    "ffmpeg not found on PATH. Install it manually: "
+                    "Windows (winget install Gyan.FFmpeg / choco install ffmpeg), "
+                    "macOS (brew install ffmpeg), Linux (apt/dnf/pacman install ffmpeg).",
+                )
                 return False
 
         if task.reason == "non-machine dep" or task.name in [
@@ -795,6 +838,51 @@ class Installer:
                 self.summary["already"].append(task.name)
                 log("info", f"{task.name} already present; skipping install")
                 return True
+
+        # OpenCV variant handling: this machine needs exactly ONE of
+        # opencv-python / opencv-python-headless (they both ship the `cv2`
+        # module and silently fight over the same namespace if both are
+        # present). Rather than blindly installing the variant the queue
+        # planned (based on headless detection), check what's *actually*
+        # on this machine first:
+        #   - desired variant already present, no conflict -> skip (already)
+        #   - conflicting variant present -> uninstall it (it's wrong for
+        #     this machine's display capability), then install/keep desired
+        #   - neither present -> fall through to normal pip install below
+        if task.name in ("opencv-python", "opencv-python-headless"):
+            conflict = (
+                "opencv-python-headless"
+                if task.name == "opencv-python"
+                else "opencv-python"
+            )
+            desired_info = pip_show(task.name)
+            conflict_info = pip_show(conflict)
+
+            if desired_info and not conflict_info:
+                self.summary["already"].append(task.name)
+                log(
+                    "info",
+                    f"{task.name} (v{desired_info.get('Version','?')}) already installed "
+                    f"and matches this machine; skipping.",
+                )
+                return True
+
+            if conflict_info:
+                log(
+                    "warn",
+                    f"Conflicting OpenCV variant '{conflict}' (v{conflict_info.get('Version','?')}) "
+                    f"is installed, but this machine needs '{task.name}'. Both variants provide "
+                    f"the 'cv2' module and conflict — uninstalling '{conflict}' first.",
+                )
+                run([sys.executable, "-m", "pip", "uninstall", "-y", conflict])
+                if desired_info:
+                    self.summary["already"].append(task.name)
+                    log(
+                        "ok",
+                        f"{task.name} remains installed after removing the conflicting variant.",
+                    )
+                    return True
+                # desired variant not installed yet -> fall through to install it
 
         pip_cmd = [sys.executable, "-m", "pip", "install"]
         if task.wheel_spec:
@@ -813,13 +901,23 @@ class Installer:
 
         log("info", f"Installing {task.name}... (this may take a few minutes)")
 
-        code, out, err = self.run_stream(
-            pip_cmd,
-            task_name=task.name,
-            show_stdout=(getattr(self.args, "verbose", False) or True),
-            show_stderr=(getattr(self.args, "verbose", False) or True),
-            capture=True,
-        )
+        # BUG-31 fix: --retries CLI flag was parsed but never applied in install_task().
+        # Use it to retry failed installs (network hiccups, transient index errors).
+        max_retries = max(1, int(getattr(self.args, "retries", 1)))
+        code = -1
+        out = err = ""
+        for attempt in range(1, max_retries + 1):
+            if attempt > 1:
+                log("warn", f"Retrying {task.name} (attempt {attempt}/{max_retries})...")
+            code, out, err = self.run_stream(
+                pip_cmd,
+                task_name=f"{task.name}{'_retry' + str(attempt - 1) if attempt > 1 else ''}",
+                show_stdout=(getattr(self.args, "verbose", False) or True),
+                show_stderr=(getattr(self.args, "verbose", False) or True),
+                capture=True,
+            )
+            if code == 0:
+                break
 
         if code == 0:
             self.summary["installed"].append(task.name)
@@ -827,7 +925,7 @@ class Installer:
             return True
         else:
             self.summary["failed"].append(task.name)
-            log("error", f"Failed to install {task.name}: returncode={code}")
+            log("error", f"Failed to install {task.name} after {max_retries} attempt(s): returncode={code}")
             tail = err.splitlines()[-10:] if err else []
             if tail:
                 log("error", "Last pip stderr lines:\n" + "\n".join(tail))
@@ -883,7 +981,11 @@ class Installer:
             log("ok", "All non-machine dependencies already present")
 
         installer = self
-        queue = self.plan_queue(env)
+        # BUG-35 fix: local variable `queue` shadowed the stdlib `import queue`
+        # module imported at the top of this file.  Renamed to `task_queue` to
+        # eliminate the shadowing so queue.Queue/queue.Empty still work correctly
+        # in run_stream() within the same method scope.
+        task_queue = self.plan_queue(env)
 
         if getattr(self.args, "auto_detect_torch", False):
             cuda_rt = self.detect_cuda_runtime()
@@ -900,9 +1002,9 @@ class Installer:
                 if info.get("torchaudio"):
                     self.summary["already"].append("torchaudio")
                 log("ok", f"Existing torch trio seems OK: {info}")
-                queue = [
+                task_queue = [
                     q
-                    for q in queue
+                    for q in task_queue
                     if q.name not in ("torch", "torchvision", "torchaudio")
                 ]
             else:
@@ -916,9 +1018,9 @@ class Installer:
                         self.summary["installed"].extend(
                             ["torch", "torchvision", "torchaudio"]
                         )
-                        queue = [
+                        task_queue = [
                             q
-                            for q in queue
+                            for q in task_queue
                             if q.name not in ("torch", "torchvision", "torchaudio")
                         ]
                     else:
@@ -941,9 +1043,9 @@ class Installer:
                         )
                         if installed:
                             self.summary["installed"].extend(missing)
-                            queue = [
+                            task_queue = [
                                 q
-                                for q in queue
+                                for q in task_queue
                                 if q.name not in ("torch", "torchvision", "torchaudio")
                             ]
                         else:
@@ -954,7 +1056,7 @@ class Installer:
 
         visible_queue = [
             q
-            for q in queue
+            for q in task_queue
             if q.name not in self.summary["already"]
             and q.name not in self.summary["installed"]
         ]
@@ -1058,4 +1160,45 @@ class Installer:
         try:
             shutil.rmtree(self.tempdir)
         except Exception:
+            pass
+, f"Wrote install metrics to {self.args.metrics_file}")
+        except Exception as e:
+            log("warn", f"Failed to write metrics file: {e}")
+
+        if RICH and CONSOLE:
+            try:
+                from rich.table import Table as _Table  # type: ignore
+
+                t = _Table(title="Installation summary", show_lines=True)
+                t.add_column("Status")
+                t.add_column("Packages")
+                t.add_row("Installed", ", ".join(self.summary["installed"]) or "-")
+                t.add_row(
+                    "Already present / Skipped",
+                    ", ".join(self.summary["already"]) or "-",
+                )
+                t.add_row("Failed", ", ".join(self.summary["failed"]) or "-")
+                t.add_row("Time(s)", f"{total_time:.1f}s")
+                CONSOLE.print(t)
+            except Exception:
+                log("info", f"Summary Installed: {self.summary['installed']}")
+                log("info", f"Already/Skipped: {self.summary['already']}")
+                log("info", f"Failed: {self.summary['failed']}")
+                log("info", f"Total time: {total_time:.1f}s")
+        else:
+            log("info", f"Summary Installed: {self.summary['installed']}")
+            log("info", f"Already/Skipped: {self.summary['already']}")
+            log("info", f"Failed: {self.summary['failed']}")
+            log("info", f"Total time: {total_time:.1f}s")
+
+    def cleanup(self):
+        try:
+            self.logfile.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(self.tempdir)
+        except Exception:
+            pass
+except Exception:
             pass

@@ -72,7 +72,10 @@ def _create_capture_thread(
             capture_queue,
             stop_event,
             cap_backend=cap_backend,
-            reconnect_delay=float(getattr(args, "reconnect_delay", 3.0)),
+            # BUG-29 fix: was getattr(args, "reconnect_delay", 3.0) — the key was
+            # missing from ARGS so it always fell back to 3.0.  reconnect_delay is
+            # now a proper ARGS attribute (config.py BUG-29 fix), use it directly.
+            reconnect_delay=float(args.reconnect_delay),
             metrics=metrics,
         )
         log.debug("RUNNER", "Starting capture thread...")
@@ -160,8 +163,13 @@ def _prepare_injected_context(args, cap_info):
             log.debug("RUNNER", traceback.format_exc())
 
         try:
+            # BUG-08 fix: hasattr(args, "dual_lines_enabled") is always True because
+            # dual_lines_enabled is always present in the ARGS namespace — the check
+            # should test the VALUE (whether dual-line mode is actually enabled), not
+            # just whether the attribute exists.  The decisions CSV is only needed in
+            # dual-line mode; writing it unconditionally wastes disk and is misleading.
             decisions_path = (
-                args.csv_decisions if hasattr(args, "dual_lines_enabled") else None
+                args.csv_decisions if args.dual_lines_enabled else None
             )
             injected_csvs = CsvWriters(
                 events_path=args.csv_events,
@@ -819,68 +827,72 @@ def run_threaded(args):
 
     if slots_enabled and vision_ready:
         try:
-            if slots_enabled:
-                # Slots output directory is required when slot system is enabled.
-                slots_dir_raw = getattr(args, "csv_slots_dir", None)
-                if not slots_dir_raw:
-                    log.error(
-                        "RUNNER",
-                        "Slots enabled but slots directory is not configured "
-                        "(expected args.csv_slots_dir).",
-                    )
-                    raise ValueError("Missing slots output directory for slot system")
+            # BUG-23 fix: inner `if slots_enabled:` was redundant — we are already
+            # inside `if slots_enabled and vision_ready:` so slots_enabled is always
+            # True here.  Removed to flatten the indentation and avoid confusion.
+            # Slots output directory is required when slot system is enabled.
+            slots_dir_raw = getattr(args, "csv_slots_dir", None)
+            if not slots_dir_raw:
+                log.error(
+                    "RUNNER",
+                    "Slots enabled but slots directory is not configured "
+                    "(expected args.csv_slots_dir).",
+                )
+                raise ValueError("Missing slots output directory for slot system")
 
-                slot_manager = SlotManager(
-                    slots_dir=Path(slots_dir_raw),
-                    run_id=getattr(args, "run_id", None),
-                    source=getattr(args, "source", None),
-                    global_count_supplier=get_global_count,
+            slot_manager = SlotManager(
+                slots_dir=Path(slots_dir_raw),
+                run_id=getattr(args, "run_id", None),
+                source=getattr(args, "source", None),
+                global_count_supplier=get_global_count,
+            )
+
+            # Register display callbacks before exposing Slot API to avoid
+            # races where API starts/stop slots before recorder callbacks exist.
+            if display is not None:
+                slot_manager.register_on_slot_start(display.on_slot_start)
+                slot_manager.register_on_slot_stop(display.on_slot_stop)
+                slot_manager.register_on_slot_abort(display.on_slot_abort)
+                log.debug(
+                    "RUNNER",
+                    "Slot lifecycle callbacks registered with DisplayWorker",
                 )
 
-                # Register display callbacks before exposing Slot API to avoid
-                # races where API starts/stop slots before recorder callbacks exist.
-                if display is not None:
-                    slot_manager.register_on_slot_start(display.on_slot_start)
-                    slot_manager.register_on_slot_stop(display.on_slot_stop)
-                    slot_manager.register_on_slot_abort(display.on_slot_abort)
-                    log.debug(
-                        "RUNNER",
-                        "Slot lifecycle callbacks registered with DisplayWorker",
-                    )
-
-                # Slot API runtime config is intentionally minimal:
-                # host/port only; enablement is controlled by slots_enabled + vision_ready.
-                slot_api_cfg = {
-                    "runtime": {
-                        "slot_api": {
-                            "host": getattr(args, "slot_api_host", "127.0.0.1"),
-                            "port": int(getattr(args, "slot_api_port", 8090)),
-                        }
+            # Slot API runtime config is intentionally minimal:
+            # host/port only; enablement is controlled by slots_enabled + vision_ready.
+            slot_api_cfg = {
+                "runtime": {
+                    "slot_api": {
+                        "host": getattr(args, "slot_api_host", "127.0.0.1"),
+                        "port": int(getattr(args, "slot_api_port", 8090)),
                     }
                 }
-                slot_api = start_slot_api_if_enabled(slot_api_cfg, slot_manager)
+            }
+            slot_api = start_slot_api_if_enabled(slot_api_cfg, slot_manager)
 
-                if slot_api:
-                    log.info(
-                        "RUNNER",
-                        f"Slot API active at http://{slot_api.host}:{slot_api.port}",
-                    )
-                else:
-                    log.warn("RUNNER", "Slot API was enabled but did not start")
-
-                if slot_manager is not None:
-                    injected["slot_manager"] = slot_manager
-                    log.debug(
-                        "RUNNER",
-                        "SlotManager initialized and injected into DisplayWorker context",
-                    )
+            if slot_api:
+                log.info(
+                    "RUNNER",
+                    f"Slot API active at http://{slot_api.host}:{slot_api.port}",
+                )
             else:
-                log.info("RUNNER", "Slot system disabled (runtime.slots_enabled=false)")
+                log.warn("RUNNER", "Slot API was enabled but did not start")
+
+            if slot_manager is not None:
+                injected["slot_manager"] = slot_manager
+                log.debug(
+                    "RUNNER",
+                    "SlotManager initialized and injected into DisplayWorker context",
+                )
         except Exception as e:
             log.error("RUNNER", f"Failed to initialize Slot system: {e}")
+    else:
+        log.info("RUNNER", "Slot system disabled (runtime.slots_enabled=false or vision not ready)")
 
     if webrtc_server and slot_manager:
-        webrtc_server._slot_manager = slot_manager  # inject slot manager reference for WebRTCServer's /health endpoint
+        # BUG-11 fix: was directly writing webrtc_server._slot_manager (private attr)
+        # because no setter existed.  set_slot_manager() is now the public API.
+        webrtc_server.set_slot_manager(slot_manager)
 
     # ── Wire live status provider into WebRTC server ──────────────────────────
     # Reads only in-memory values; zero pipeline overhead.
