@@ -34,8 +34,13 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--index-url",
-        default="https://download.pytorch.org/whl/cu118",
-        help="Primary index for PyTorch wheels",
+        default=None,
+        help=(
+            "Primary index for PyTorch wheels. If not given, this is derived "
+            "automatically from --cuda-tag (e.g. cu121 -> "
+            ".../whl/cu121, cpu -> .../whl/cpu) so the wheel tag and the "
+            "index always match."
+        ),
     )
     ap.add_argument(
         "--extra-index-url",
@@ -100,7 +105,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    return ap.parse_args()
+    args = ap.parse_args()
+
+    # BUG-50 fix: --index-url and --cuda-tag used to have independent
+    # hardcoded defaults (cu118 / .../whl/cu118) that only matched by
+    # coincidence. If the user changed --cuda-tag (e.g. to cu121) without
+    # also changing --index-url, plan_queue() would build a wheel_spec like
+    # "torch==2.5.1+cu121" but pass "-i .../whl/cu118" to pip, which then
+    # fails with "No matching distribution found for torch==...+cu121".
+    # Derive --index-url from --cuda-tag automatically unless the user
+    # explicitly passed --index-url.
+    if args.index_url is None:
+        cuda_tag = getattr(args, "cuda_tag", None) or "cu118"
+        if cuda_tag == "cpu":
+            args.index_url = "https://download.pytorch.org/whl/cpu"
+        else:
+            args.index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+
+    return args
 
 
 def _signal_handler(sig, frame):

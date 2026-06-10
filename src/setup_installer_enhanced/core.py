@@ -420,6 +420,28 @@ class Installer:
                             "ok",
                             f"Installed torch trio from {index_label} (candidate {cand}) successfully.",
                         )
+                        # BUG-50 fix: a successful pip install only proves the
+                        # wheel exists and installs cleanly — it does NOT
+                        # prove the GPU build actually works on this
+                        # machine's CUDA driver (e.g. a cu130 build can
+                        # install fine on a driver that only supports CUDA
+                        # 12.7, but torch.cuda.is_available() then returns
+                        # False). When this is a GPU candidate and an NVIDIA
+                        # GPU is present, verify CUDA actually initializes;
+                        # if not, uninstall and fall back to the next
+                        # (older) candidate tag instead of reporting success.
+                        if cand != "cpu" and self._detect_nvidia_smi_basic():
+                            if self._verify_torch_cuda_usable():
+                                return True
+                            log(
+                                "warn",
+                                f"torch installed from {index_label} (candidate {cand}) "
+                                "but torch.cuda.is_available() is False on this machine "
+                                "(likely a CUDA build too new for the installed driver). "
+                                "Uninstalling and trying an older CUDA tag...",
+                            )
+                            self.uninstall_trio()
+                            continue
                         return True
                     else:
                         log(
@@ -437,6 +459,33 @@ class Installer:
                     pass
 
         log("error", "Could not install torch trio across all candidates.")
+        return False
+
+    def _verify_torch_cuda_usable(self) -> bool:
+        """BUG-50 fix: run torch.cuda.is_available() in a *fresh* subprocess.
+
+        We must not just `importlib.import_module("torch")` here: if torch
+        was already imported earlier in this process (e.g. by a previous
+        candidate attempt or by get_installed_torch_info()), Python would
+        return the cached module from sys.modules instead of the
+        freshly-installed one, giving a stale/incorrect result. A subprocess
+        always sees the package as pip just installed it.
+        """
+        code, out, err = run(
+            [
+                sys.executable,
+                "-c",
+                "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)",
+            ]
+        )
+        if code == 0:
+            log("ok", "Verified torch.cuda.is_available() == True for this build.")
+            return True
+        log(
+            "warn",
+            f"torch.cuda.is_available() check failed (exit {code}). "
+            f"stdout={out!r} stderr={err!r}",
+        )
         return False
 
     def get_installed_torch_info(self) -> dict:
