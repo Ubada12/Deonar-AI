@@ -114,29 +114,74 @@ class Installer:
         return {"nvidia": n, "ffmpeg": ff, "headless": head}
 
     def _detect_nvidia_smi_basic(self) -> Optional[dict]:
+        # BUG-51 fix: also query compute_cap (e.g. "12.0" for Blackwell /
+        # RTX 50-series, "9.0" for Hopper, "8.9" for Ada/RTX 40-series).
+        # This tells us the minimum torch version that ships kernels for
+        # this GPU's architecture, independent of the driver/CUDA-runtime
+        # check done elsewhere. Older nvidia-smi builds may not support the
+        # "compute_cap" field, so fall back to the basic query if it errors.
         code, out, err = run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,driver_version,count",
+                "--query-gpu=name,driver_version,count,compute_cap",
                 "--format=csv,noheader",
             ]
         )
+        has_compute_cap = True
         if code != 0 or not out.strip():
+            has_compute_cap = False
+            log(
+                "info",
+                "nvidia-smi --query-gpu=...,compute_cap failed "
+                f"(exit {code}); retrying without compute_cap field. "
+                f"stderr={err!r}",
+            )
+            code, out, err = run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,driver_version,count",
+                    "--format=csv,noheader",
+                ]
+            )
+        if code != 0 or not out.strip():
+            log("warn", f"nvidia-smi query failed entirely (exit {code}): {err}")
             return None
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         names = []
         driver = None
         total = 0
+        compute_caps = []
         for ln in lines:
             parts = [p.strip() for p in ln.split(",")]
-            if len(parts) >= 3:
+            min_parts = 4 if has_compute_cap else 3
+            if len(parts) >= min_parts:
                 names.append(parts[0])
                 driver = parts[1]
                 try:
                     total += int(parts[2])
                 except Exception:
                     total += 1
-        return {"gpus": total, "names": names, "driver": driver}
+                if has_compute_cap:
+                    try:
+                        compute_caps.append(float(parts[3]))
+                    except Exception:
+                        log(
+                            "info",
+                            f"Could not parse compute_cap from nvidia-smi line: {ln!r}",
+                        )
+        compute_cap = max(compute_caps) if compute_caps else None
+        result = {
+            "gpus": total,
+            "names": names,
+            "driver": driver,
+            "compute_cap": compute_cap,
+        }
+        log(
+            "info",
+            f"nvidia-smi GPU detection: gpus={total} names={names} "
+            f"driver={driver} compute_cap={compute_cap}",
+        )
+        return result
 
     def detect_ffmpeg(self) -> bool:
         code, out, err = run(["ffmpeg", "-version"])
@@ -343,6 +388,145 @@ class Installer:
         seen.append("cpu")
         return seen
 
+    # BUG-51: known-good pinned torch/torchvision/torchaudio combos, used as
+    # a last-resort fallback in try_install_torch_trio() when "latest torch"
+    # fails torch.cuda.is_available() on every driver-compatible CUDA tag.
+    # Each entry is (min_compute_capability, cuda_tag, torch_ver,
+    # torchvision_ver, torchaudio_ver). The first entry whose
+    # min_compute_capability the detected GPU meets/exceeds is used,
+    # provided its cuda_tag is in the driver-compatible candidate list.
+    #   - 12.0 = Blackwell (RTX 50-series / B100 etc.) -> needs torch >= 2.7
+    #   -  9.0 = Hopper / Ada / Ampere and newer
+    #   -  0.0 = catch-all for older GPUs
+    _PINNED_TORCH_FALLBACKS = [
+        (12.0, "cu128", "2.7.1", "0.22.1", "2.7.1"),
+        (9.0, "cu121", "2.5.1", "0.20.1", "2.5.1"),
+        (0.0, "cu118", "2.5.1", "0.20.1", "2.5.1"),
+    ]
+
+    def _try_pinned_fallback(
+        self,
+        gpu_info: dict,
+        candidates: List[str],
+        no_deps: bool,
+        tv_ver: Optional[str],
+        ta_ver: Optional[str],
+    ) -> bool:
+        """BUG-51 fix: install one known-good pinned torch/vision/audio combo.
+
+        Used when "latest torch" failed torch.cuda.is_available() on every
+        driver-compatible CUDA tag (a real-world case: RTX 5090/Blackwell +
+        driver supporting up to CUDA 12.8, where "latest" torch is built
+        against CUDA 13 and refuses to initialize on this driver, while older
+        cuXXX-pinned torch builds predate Blackwell kernel support).
+        """
+        cc = gpu_info.get("compute_cap")
+        log(
+            "info",
+            f"BUG-51 pinned-fallback: GPU compute capability detected as "
+            f"{cc!r}; selecting a pinned torch build known to support both "
+            "this architecture and this driver's CUDA ceiling.",
+        )
+        if cc is None:
+            log(
+                "warn",
+                "BUG-51 pinned-fallback: nvidia-smi did not report a compute "
+                "capability (older nvidia-smi?) — cannot safely pick a "
+                "pinned build. Skipping pinned fallback.",
+            )
+            return False
+
+        chosen = None
+        for min_cc, cuda_tag, t_ver, tv_pin, ta_pin in self._PINNED_TORCH_FALLBACKS:
+            if cc >= min_cc:
+                chosen = (min_cc, cuda_tag, t_ver, tv_pin, ta_pin)
+                break
+
+        if chosen is None:
+            log(
+                "warn",
+                f"BUG-51 pinned-fallback: no pinned combo matches compute "
+                f"capability {cc}. Skipping pinned fallback.",
+            )
+            return False
+
+        min_cc, cuda_tag, t_ver, tv_pin, ta_pin = chosen
+        if tv_ver:
+            tv_pin = tv_ver
+        if ta_ver:
+            ta_pin = ta_ver
+
+        if cuda_tag not in candidates:
+            log(
+                "warn",
+                f"BUG-51 pinned-fallback: pinned combo for compute capability "
+                f">= {min_cc} needs CUDA tag '{cuda_tag}', but that tag is "
+                f"not in this driver's compatible tag list {candidates}. "
+                "The driver may be too old even for the pinned build. "
+                "Skipping pinned fallback.",
+            )
+            return False
+
+        index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+        pkg_specs = [
+            f"torch=={t_ver}+{cuda_tag}",
+            f"torchvision=={tv_pin}+{cuda_tag}",
+            f"torchaudio=={ta_pin}+{cuda_tag}",
+        ]
+        log(
+            "info",
+            f"BUG-51 pinned-fallback: installing pinned trio "
+            f"{pkg_specs} from {index_url} "
+            f"(matched compute capability {cc} >= {min_cc}).",
+        )
+        install_cmd = (
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+            + pkg_specs
+            + ["-i", index_url, "--extra-index-url", self.args.extra_index_url]
+        )
+        if no_deps:
+            install_cmd.append("--no-deps")
+        if "--progress-bar=on" not in install_cmd:
+            install_cmd += ["--progress-bar=on", "-v"]
+
+        log(
+            "info",
+            "BUG-51 pinned-fallback: running pip install: "
+            + " ".join(install_cmd),
+        )
+        code, out, err = self.run_stream(
+            install_cmd, task_name="torch.trio.pinned-fallback", show_stdout=True
+        )
+        if code != 0:
+            log(
+                "warn",
+                f"BUG-51 pinned-fallback: pip install of pinned trio failed "
+                f"(exit {code}). stdout={out} stderr={err}",
+            )
+            return False
+
+        log(
+            "ok",
+            f"BUG-51 pinned-fallback: installed pinned torch=={t_ver}+{cuda_tag} "
+            "trio successfully. Verifying torch.cuda.is_available()...",
+        )
+        if self._verify_torch_cuda_usable():
+            log(
+                "ok",
+                f"BUG-51 pinned-fallback: torch=={t_ver}+{cuda_tag} verified "
+                "working (torch.cuda.is_available() == True).",
+            )
+            return True
+
+        log(
+            "warn",
+            f"BUG-51 pinned-fallback: pinned torch=={t_ver}+{cuda_tag} also "
+            "failed torch.cuda.is_available(). Uninstalling before "
+            "continuing to CPU-only fallback.",
+        )
+        self.uninstall_trio()
+        return False
+
     def try_install_torch_trio(
         self, candidates: List[str], no_deps: bool = False
     ) -> bool:
@@ -352,9 +536,48 @@ class Installer:
         )
         tv_ver = getattr(self.args, "torchvision_version", None)
         ta_ver = getattr(self.args, "torchaudio_version", None)
+        pinned_fallback_tried = False
 
         for cand in candidates:
             if cand == "cpu":
+                # BUG-51 fix: before giving up and installing CPU-only torch,
+                # check whether every GPU candidate failed verification not
+                # because the GPU is unsupported, but because "latest torch"
+                # under every cuXXX index resolves to the SAME build (e.g.
+                # torch 2.12.0/CUDA13) which this driver can't run, AND/OR
+                # this GPU's architecture (e.g. Blackwell/RTX 50-series,
+                # compute_cap 12.0) needs torch >= 2.7 for kernel support.
+                # In that case, try one known-good PINNED torch/vision/audio
+                # combo before falling back to CPU-only.
+                if not pinned_fallback_tried:
+                    pinned_fallback_tried = True
+                    gpu_info = self._detect_nvidia_smi_basic()
+                    if gpu_info and gpu_info.get("gpus", 0) > 0:
+                        log(
+                            "warn",
+                            "All driver-detected CUDA tags failed verification "
+                            f"({[c for c in candidates if c != 'cpu']}). "
+                            "An NVIDIA GPU is present "
+                            f"({gpu_info.get('names')}, compute_cap="
+                            f"{gpu_info.get('compute_cap')}) — trying a known-good "
+                            "pinned torch build before falling back to CPU-only "
+                            "(BUG-51).",
+                        )
+                        if self._try_pinned_fallback(
+                            gpu_info, candidates, no_deps, tv_ver, ta_ver
+                        ):
+                            return True
+                        log(
+                            "warn",
+                            "Pinned-fallback (BUG-51) also failed verification; "
+                            "proceeding with CPU-only torch as last resort.",
+                        )
+                    else:
+                        log(
+                            "info",
+                            "No NVIDIA GPU detected via nvidia-smi; proceeding "
+                            "directly with CPU-only torch.",
+                        )
                 index_args = ["-i", self.args.extra_index_url]
                 index_label = self.args.extra_index_url
             else:
