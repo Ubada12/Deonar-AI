@@ -266,5 +266,3 @@ def run_original(args):
             "RUNNER-INFO",
             f" Done. Up={state.up_count}, Down={state.down_count}, Total={state.up_count + state.down_count}",
         )
-t}",
-        )
