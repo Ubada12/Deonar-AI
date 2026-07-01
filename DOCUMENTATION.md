@@ -614,7 +614,7 @@ The slot system allows an operator to partition the global count into per-vendor
 ### Slot Management Interface
 
 <p align="center">
-  <img src="assets/screenshots/slot-management-ui.png" width="100%">
+  <img src="assets/screenshots/live-dashboard.png" width="100%">
 </p>
 
 <p align="center">
