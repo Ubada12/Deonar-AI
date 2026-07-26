@@ -300,11 +300,51 @@ Models were trained on a custom dataset of more than 20,000 annotated livestock 
 
 ### Download Models
 
-Models are hosted on HuggingFace:
+The pre-trained models are hosted in a gated Hugging Face repository:
 
 ```text
 https://huggingface.co/ubada11/goat-detection-yolov11
 ```
+
+Access is granted manually to ensure the models are distributed only to approved users, since this is a production model trained on proprietary operational data rather than a generic open-source release.
+
+### Request Model Access
+
+1. Open the Hugging Face model repository.
+2. Click **Request Access**.
+3. Wait for approval from the repository owner.
+4. Once approved, continue with the download instructions below.
+
+If your access request is declined, or if you require access for academic, research, or commercial use, please contact:
+
+**Ubada Ghawte**
+📧 [ubadaghawte2005@gmail.com](mailto:ubadaghawte2005@gmail.com)
+
+Include a short description of:
+
+* who you are
+* your organisation (if any)
+* intended use of the model
+
+### Authenticate with Hugging Face
+
+Once your request has been approved, authenticate with your own Hugging Face account before downloading the model:
+
+```text
+hf auth login
+```
+
+or
+
+```text
+huggingface-cli login
+```
+
+* Create a **Read** access token from your Hugging Face account.
+* Use that token when running `hf auth login`.
+* The token authenticates your own account after access has been approved.
+
+### Download the Model
 
 Download the preferred model and place it inside:
 
@@ -475,6 +515,8 @@ setup-installer --auto-detect-torch --force-reinstall --dry-run
 ## ⚠️ Warning
 
 * Before running the application, download the required detection model from the HuggingFace repository and place the model file inside the `models/` directory. The application does not automatically download model weights, so this step is required for successful inference.
+
+* The model repository is **gated** — access must be requested and approved, and downloading requires authenticating with your own Hugging Face account. See [Download Models](#download-models) above for the full process.
 
 * Ensure that the model path specified in `configs/config.yaml` matches the model file you placed in the `models/` directory. Incorrect paths or model names will prevent the application from starting correctly.
 
